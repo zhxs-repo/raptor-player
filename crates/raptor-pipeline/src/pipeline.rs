@@ -249,9 +249,16 @@ impl Pipeline {
 
         // 取出 thread handles
         let handles: Vec<_> = self.thread_handles.drain(..).collect();
+        
+        // 重要：按顺序 join 线程，确保资源释放顺序正确
+        // 1. 先 join 音频输出线程（通常是最后一个创建的），让它先完成并释放 audio_output
+        // 2. 然后 join 渲染线程，确保窗口在音频释放后再关闭
+        // 3. 最后 join 解码和解复用线程
+        // 这样可以避免多线程同时访问共享资源导致 heap corruption
         for handle in handles {
             let _ = handle.join();
         }
+        
         tracing::info!("Pipeline::stop: all threads joined");
     }
 

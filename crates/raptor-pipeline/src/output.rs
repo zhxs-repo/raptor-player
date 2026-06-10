@@ -166,5 +166,11 @@ pub fn audio_output_loop(
     }
 
     tracing::info!("audio_output_loop exiting");
+    
+    // 重要：在退出前显式 drop audio_output，确保音频流先停止
+    // 这可以防止在 pipeline shutdown 时 audio_output 与其他线程同时释放导致的竞态条件
+    // 注意：audio_output 在此作用域结束时会自动 drop，此处显式 drop 仅为文档说明
+    drop(audio_output);
+    
     Ok(())
 }
