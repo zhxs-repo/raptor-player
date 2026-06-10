@@ -73,8 +73,9 @@ impl WindowRenderer {
         let window = event_loop.create_window(window_attributes)
             .map_err(|e| format!("window: {e}"))?;
 
+        // 强制使用 DX12/DX11 后端，避免 Windows Vulkan 初始化崩溃
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::DX12 | wgpu::Backends::DX11,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
         });
