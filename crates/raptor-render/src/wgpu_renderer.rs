@@ -6,7 +6,13 @@ use winit::event_loop::{EventLoop, EventLoopBuilder};
 use winit::platform::pump_events::EventLoopExtPumpEvents;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
-use winit::window::WindowBuilder;
+
+// wgpu v29+ types
+use wgpu::{
+    SurfaceStatus,
+    ImageCopyTextureBase as ImageCopyTexture,
+    ImageDataLayoutBase as ImageDataLayout,
+};
 
 /// VideoOutput trait — 视频输出抽象
 pub trait VideoOutput: Send {
@@ -56,19 +62,21 @@ impl WindowRenderer {
         height: u32,
         closed_flag: Arc<AtomicBool>,
     ) -> std::result::Result<Self, String> {
-        let mut builder = EventLoopBuilder::new();
+        let builder = EventLoop::builder();
         #[cfg(target_os = "windows")]
-        builder.with_any_thread(true);
+        let builder = builder.with_any_thread(true);
         let event_loop = builder.build().map_err(|e| format!("event loop: {e}"))?;
-        let window = WindowBuilder::new()
+        
+        let window_attributes = WindowAttributes::default()
             .with_title("Raptor Player")
-            .with_inner_size(winit::dpi::LogicalSize::new(width, height))
-            .build(&event_loop)
+            .with_inner_size(winit::dpi::LogicalSize::new(width, height));
+        let window = event_loop.create_window(window_attributes)
             .map_err(|e| format!("window: {e}"))?;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
         });
 
         let surface = instance.create_surface(&window)
@@ -87,6 +95,8 @@ impl WindowRenderer {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
             },
         ))
         .map_err(|e| format!("device: {e}"))?;
@@ -142,7 +152,7 @@ impl WindowRenderer {
         let mut should_close = false;
         let _ =
             self.event_loop
-                .pump_events(Some(std::time::Duration::from_millis(5)), |event, _| {
+                .pump_app_events(Some(std::time::Duration::from_millis(5)), |event, _| {
                     if let winit::event::Event::WindowEvent {
                         event: winit::event::WindowEvent::CloseRequested,
                         ..
@@ -266,11 +276,11 @@ impl WindowRenderer {
             Ok(t) => t,
             Err(err) => {
                 match err {
-                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                    SurfaceStatus::Lost | SurfaceStatus::Outdated => {
                         let _ = self.surface.configure(&self.device, &self.surface_config);
                         return;
                     }
-                    wgpu::SurfaceError::OutOfMemory => {
+                    SurfaceStatus::OutOfMemory => {
                         tracing::error!("GPU out of memory");
                         return;
                     }
@@ -294,6 +304,7 @@ impl WindowRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -415,21 +426,21 @@ impl WindowRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("yuv_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("yuv_render_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: None,
@@ -448,7 +459,8 @@ impl WindowRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: 0,
+            cache: None,
         });
         (render_pipeline, bind_group, y_texture, uv_texture)
     }
