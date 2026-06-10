@@ -71,12 +71,8 @@ impl WindowRenderer {
             ..Default::default()
         });
 
-        let surface = unsafe {
-            wgpu::SurfaceTargetUnsafe::from_window(&window)
-                .map(|target| instance.create_surface_unsafe(target))
-                .map_err(|e| format!("surface target: {e}"))?
-        }
-        .map_err(|e| format!("surface: {e}"))?;
+        let surface = instance.create_surface(&window)
+            .map_err(|e| format!("surface: {e}"))?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -91,7 +87,6 @@ impl WindowRenderer {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
             },
-            None,
         ))
         .map_err(|e| format!("device: {e}"))?;
 
@@ -271,17 +266,25 @@ impl WindowRenderer {
 
         let surface_texture = match self.surface.get_current_texture() {
             Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                tracing::error!("GPU out of memory");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("surface texture error: {}", e);
-                return;
+            Err(err) => {
+                match err {
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                        self.surface.configure(&self.device, &self.surface_config);
+                        return;
+                    }
+                    wgpu::SurfaceError::OutOfMemory => {
+                        tracing::error!("GPU out of memory");
+                        return;
+                    }
+                    wgpu::SurfaceError::Other => {
+                        tracing::warn!("surface texture error: other");
+                        return;
+                    }
+                    wgpu::SurfaceError::Timeout => {
+                        tracing::warn!("surface texture error: timeout");
+                        return;
+                    }
+                }
             }
         };
 

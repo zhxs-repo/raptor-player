@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.dependencies]
 # LTS locked
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "filter", "software-scaling", "software-resampling"] }
-wgpu = "0.20"
+wgpu = "24"
 cpal = "0.15"
 tokio = { version = "1", features = ["sync", "rt"] }
 crossbeam-channel = "0.5"
@@ -23,6 +23,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-winit = "0.29"
+winit = "0.30"
 pollster = "0.4"
 thiserror = "1"
