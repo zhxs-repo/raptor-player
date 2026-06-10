@@ -74,10 +74,10 @@ impl WindowRenderer {
             .map_err(|e| format!("window: {e}"))?;
 
         // 强制使用 DX12/DX11 后端，避免 Windows Vulkan 初始化崩溃
+        // 使用默认后端选项，让 wgpu 自动选择最佳的 DX12 配置
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12 | wgpu::Backends::DX11,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
+            ..Default::default()
         });
 
         let surface = instance.create_surface(&window)
