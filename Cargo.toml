@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/raptor-core",
+    "crates/raptor-ffmpeg",
+    "crates/raptor-render",
+    "crates/raptor-audio",
+    "crates/raptor-pipeline",
+    "crates/raptor-ffi",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# LTS locked
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "filter", "software-scaling", "software-resampling"] }
+wgpu = "0.20"
+cpal = "0.15"
+tokio = { version = "1", features = ["sync", "rt"] }
+crossbeam-channel = "0.5"
+
+# Common
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+winit = "0.29"
+pollster = "0.4"
+thiserror = "1"

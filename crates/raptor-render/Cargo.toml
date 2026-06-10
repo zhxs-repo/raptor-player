@@ -1,0 +1,13 @@
+[package]
+name = "raptor-render"
+version = "0.1.0"
+edition = "2021"
+description = "Raptor video renderer: wgpu soft-decode rendering + WGSL shaders"
+
+[dependencies]
+raptor-core = { path = "../raptor-core" }
+raptor-ffmpeg = { path = "../raptor-ffmpeg" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+tracing = { workspace = true }

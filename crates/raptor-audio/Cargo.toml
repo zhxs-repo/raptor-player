@@ -1,0 +1,12 @@
+[package]
+name = "raptor-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Raptor audio output: AudioOutput trait + cpal implementation"
+
+[dependencies]
+raptor-core = { path = "../raptor-core" }
+raptor-ffmpeg = { path = "../raptor-ffmpeg" }
+cpal = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

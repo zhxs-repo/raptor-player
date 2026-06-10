@@ -1,0 +1,11 @@
+[package]
+name = "raptor-ffmpeg"
+version = "0.1.0"
+edition = "2021"
+description = "Raptor FFmpeg adapter: Demuxer/Decoder traits + FfmpegXxx impls"
+
+[dependencies]
+raptor-core = { path = "../raptor-core" }
+ffmpeg-next = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
