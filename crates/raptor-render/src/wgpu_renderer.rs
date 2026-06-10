@@ -82,12 +82,34 @@ impl WindowRenderer {
         let surface = instance.create_surface(&window)
             .expect("Failed to create surface");
 
+        // 尝试请求高性能适配器，失败后回退到兼容/软件适配器
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-        }))
-        .ok_or_else(|| "no suitable GPU adapter".to_string())?;
+        }));
+
+        let adapter = match adapter {
+            Some(a) => a,
+            None => {
+                log::warn!("No high-performance GPU adapter found, trying fallback adapter...");
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: true,
+                }))
+                .ok_or_else(|| {
+                    let backends = instance.enumerate_adapters_sync();
+                    format!(
+                        "no suitable GPU adapter found. Available backends: {:?}. \
+                         Ensure you have updated GPU drivers and DirectX 12 is available.",
+                        backends.iter().map(|a| a.get_info().backend).collect::<Vec<_>>()
+                    )
+                })?
+            }
+        };
+
+        log::info!("Using GPU adapter: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
