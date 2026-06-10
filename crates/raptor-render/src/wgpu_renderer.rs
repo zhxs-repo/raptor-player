@@ -72,7 +72,7 @@ impl WindowRenderer {
         });
 
         let surface = instance.create_surface(&window)
-            .map_err(|e| format!("surface: {e}"))?;
+            .expect("Failed to create surface");
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -86,6 +86,7 @@ impl WindowRenderer {
                 label: Some("raptor_device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
             },
         ))
         .map_err(|e| format!("device: {e}"))?;
@@ -107,7 +108,7 @@ impl WindowRenderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &surface_config);
+        let _ = surface.configure(&device, &surface_config);
 
         let (render_pipeline, bind_group, y_texture, uv_texture) =
             Self::setup_pipeline(&device, surface_format, width, height);
@@ -176,7 +177,7 @@ impl WindowRenderer {
             self.uv_texture = uvt;
             self.surface_config.width = frame.width.max(1);
             self.surface_config.height = frame.height.max(1);
-            self.surface.configure(&self.device, &self.surface_config);
+            let _ = self.surface.configure(&self.device, &self.surface_config);
         }
 
         if let (Some(y_tex), Some(y_plane)) = (Some(&self.y_texture), frame.planes.first()) {
@@ -185,7 +186,6 @@ impl WindowRenderer {
                     texture: y_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
                 },
                 &y_plane.data,
                 wgpu::ImageDataLayout {
@@ -210,7 +210,6 @@ impl WindowRenderer {
                                 texture: uv_tex,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
                             },
                             &uv_plane.data,
                             wgpu::ImageDataLayout {
@@ -246,7 +245,6 @@ impl WindowRenderer {
                             texture: uv_tex,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
                         },
                         &uv_interleaved,
                         wgpu::ImageDataLayout {
@@ -269,19 +267,15 @@ impl WindowRenderer {
             Err(err) => {
                 match err {
                     wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                        self.surface.configure(&self.device, &self.surface_config);
+                        let _ = self.surface.configure(&self.device, &self.surface_config);
                         return;
                     }
                     wgpu::SurfaceError::OutOfMemory => {
                         tracing::error!("GPU out of memory");
                         return;
                     }
-                    wgpu::SurfaceError::Other => {
-                        tracing::warn!("surface texture error: other");
-                        return;
-                    }
-                    wgpu::SurfaceError::Timeout => {
-                        tracing::warn!("surface texture error: timeout");
+                    _ => {
+                        tracing::warn!("surface texture error: {err:?}");
                         return;
                     }
                 }

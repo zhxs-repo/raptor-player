@@ -10,9 +10,9 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-# LTS locked
+# Updated to latest stable
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "filter", "software-scaling", "software-resampling"] }
-wgpu = "24"
+wgpu = "29"
 cpal = "0.15"
 tokio = { version = "1", features = ["sync", "rt"] }
 crossbeam-channel = "0.5"
