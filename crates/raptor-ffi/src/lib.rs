@@ -121,17 +121,25 @@ impl Player {
             renderer.init(vi.width, vi.height)?;
         }
 
-        // 创建 pipeline（暂停状态）
+        // 创建 pipeline（暂停状态）— 将 demuxer 传递给 pipeline，避免重复打开文件
         let (crossbeam_tx, crossbeam_rx) = crossbeam_channel::bounded(64);
         let mut pipeline = Pipeline::new(crossbeam_tx);
         pipeline.pause(); // 创建后先暂停，等 Play 命令再恢复
-        pipeline.start(
+        tracing::info!("load_file: calling pipeline.start()...");
+        match pipeline.start(
             url,
+            Box::new(demuxer),
             Box::new(renderer),
             duration,
             video_info.clone(),
             audio_info.clone(),
-        )?;
+        ) {
+            Ok(()) => tracing::info!("load_file: pipeline.start() returned Ok"),
+            Err(e) => {
+                tracing::error!("load_file: pipeline.start() FAILED: {}", e);
+                return Err(e);
+            }
+        }
         let pipeline = Arc::new(pipeline);
 
         *self.pipeline.lock() = Some(pipeline.clone());
@@ -240,6 +248,16 @@ impl Player {
     }
 
     fn seek(&self, target: f64, _mode: SeekMode) -> raptor_core::Result<CommandResult> {
+        // 状态检查：只有 Playing 和 Paused 可以 seek
+        let state = self.state.lock();
+        state
+            .can_transition_to(&PlayerEvent::Seek {
+                target,
+                mode: SeekMode::Absolute,
+            })
+            .map_err(RaptorError::InvalidState)?;
+        drop(state);
+
         let pos = self
             .pipeline
             .lock()

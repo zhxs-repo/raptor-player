@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::SampleFormat;
 use parking_lot::Mutex;
 use raptor_core::{RaptorError, Result};
 use raptor_ffmpeg::AudioFrame;
@@ -28,8 +29,9 @@ pub trait AudioOutput: Send {
 pub struct CpalOutput {
     stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<VecDeque<f32>>>,
-    volume: f32,
-    sample_rate: u32,
+    volume: Arc<std::sync::atomic::AtomicU32>, // 用 atomic bits 存 f32
+    sample_rate: u32,      // 源采样率（FFmpeg 输出）
+    device_rate: u32,      // 设备采样率（cpal 实际播放）
     channels: u32,
 }
 
@@ -42,8 +44,9 @@ impl CpalOutput {
         Self {
             stream: None,
             buffer: Arc::new(Mutex::new(VecDeque::new())),
-            volume: 1.0,
+            volume: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             sample_rate: 0,
+            device_rate: 0,
             channels: 0,
         }
     }
@@ -70,41 +73,66 @@ impl AudioOutput for CpalOutput {
             .default_output_device()
             .ok_or_else(|| RaptorError::Audio("no default audio output device".into()))?;
 
-        let config = cpal::StreamConfig {
-            channels: channels as u16,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
+        // 查询设备默认输出配置，使用设备支持的格式
+        let supported_config = device
+            .default_output_config()
+            .map_err(|e| RaptorError::Audio(format!("get default output config: {e}")))?;
+
+        let device_sample_rate = supported_config.sample_rate().0;
+        let device_channels = supported_config.channels();
+        let device_format = supported_config.sample_format();
 
         tracing::info!(
-            "CpalOutput::init: {}Hz, {}ch, device={}",
+            "CpalOutput::init: source={}Hz {}ch, device={}Hz {}ch {:?}, device_name={}",
             sample_rate,
             channels,
+            device_sample_rate,
+            device_channels,
+            device_format,
             device.name().unwrap_or_default()
         );
 
-        let buffer = self.buffer.clone();
-        let volume = self.volume;
+        self.device_rate = device_sample_rate;
 
-        let stream = device
-            .build_output_stream(
+        let config: cpal::StreamConfig = supported_config.into();
+        let buffer = self.buffer.clone();
+        let volume = self.volume.clone();
+
+        // 根据设备支持的采样格式构建流
+        let stream = match device_format {
+            SampleFormat::F32 => device.build_output_stream(
                 &config,
-                move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let vol = f32::from_bits(volume.load(std::sync::atomic::Ordering::Relaxed));
                     let mut buf = buffer.lock();
                     for sample in data.iter_mut() {
-                        if let Some(s) = buf.pop_front() {
-                            *sample = s * volume;
-                        } else {
-                            *sample = 0.0;
-                        }
+                        *sample = buf.pop_front().unwrap_or(0.0) * vol;
                     }
                 },
-                move |err| {
-                    tracing::error!("cpal output stream error: {}", err);
-                },
+                move |err| tracing::error!("cpal output stream error: {}", err),
                 None,
-            )
-            .map_err(|e| RaptorError::Audio(format!("build output stream: {e}")))?;
+            ),
+            SampleFormat::I16 => device.build_output_stream(
+                &config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    let vol = f32::from_bits(volume.load(std::sync::atomic::Ordering::Relaxed));
+                    let mut buf = buffer.lock();
+                    for sample in data.iter_mut() {
+                        let s = buf.pop_front().unwrap_or(0.0) * vol;
+                        *sample = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                    }
+                },
+                move |err| tracing::error!("cpal output stream error: {}", err),
+                None,
+            ),
+            _ => {
+                return Err(RaptorError::Audio(format!(
+                    "unsupported device sample format: {:?}",
+                    device_format
+                )));
+            }
+        }
+        .map_err(|e| RaptorError::Audio(format!("build output stream: {e}")))?;
 
         stream
             .play()
@@ -116,16 +144,43 @@ impl AudioOutput for CpalOutput {
 
     fn write(&mut self, frame: &AudioFrame) -> Result<()> {
         let mut buf = self.buffer.lock();
-        buf.extend(frame.samples.iter());
+        if self.sample_rate == self.device_rate || self.device_rate == 0 {
+            // 采样率匹配，直接推入
+            buf.extend(frame.samples.iter());
+        } else {
+            // 线性重采样：source_rate → device_rate
+            let channels = self.channels as usize;
+            let ratio = self.device_rate as f64 / self.sample_rate as f64;
+            let src_frames = frame.samples.len() / channels;
+            let out_frames = (src_frames as f64 * ratio).ceil() as usize;
+
+            for i in 0..out_frames {
+                let src_pos = i as f64 / ratio;
+                let src_idx = src_pos.floor() as usize;
+                let frac = (src_pos - src_idx as f64) as f32;
+
+                for ch in 0..channels {
+                    let s0 = frame.samples.get(src_idx * channels + ch).copied().unwrap_or(0.0);
+                    let s1 = frame
+                        .samples
+                        .get((src_idx + 1) * channels + ch)
+                        .copied()
+                        .unwrap_or(0.0);
+                    buf.push_back(s0 + (s1 - s0) * frac);
+                }
+            }
+        }
         Ok(())
     }
 
     fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
+        let v = volume.clamp(0.0, 1.0);
+        self.volume
+            .store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn volume(&self) -> f32 {
-        self.volume
+        f32::from_bits(self.volume.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -145,7 +200,7 @@ mod tests {
     #[test]
     fn test_cpal_output_new() {
         let output = CpalOutput::new();
-        assert_eq!(output.volume, 1.0);
+        assert!((output.volume() - 1.0).abs() < 0.001);
         assert_eq!(output.sample_rate, 0);
         assert!(output.stream.is_none());
     }

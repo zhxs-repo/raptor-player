@@ -16,6 +16,7 @@ pub fn demux_loop(
 ) -> raptor_core::Result<()> {
     tracing::info!("demux_loop started");
 
+    let mut pkt_count: u64 = 0;
     loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
             tracing::info!("demux_loop: shutdown requested");
@@ -60,6 +61,10 @@ pub fn demux_loop(
 
         match demuxer.read_packet() {
             Ok(Some(pkt)) => {
+                pkt_count += 1;
+                if pkt_count.is_multiple_of(100) {
+                    tracing::info!("demux: read {} packets", pkt_count);
+                }
                 let info = demuxer.info().unwrap();
                 let stream_idx = pkt.stream_index;
                 if Some(stream_idx) == info.video_stream_index {

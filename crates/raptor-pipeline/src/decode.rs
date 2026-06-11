@@ -7,6 +7,11 @@ use raptor_ffmpeg::{AudioDecoder, AudioFrame, Packet, VideoDecoder, VideoFrame};
 use crate::pipeline::Pipeline;
 
 /// Video decode loop — 从 video_pkt_rx 接收数据包，解码后送入 video_frame_tx
+///
+/// **节流机制**：当输出 buffer 超过 `MAX_BUFFER_FRAMES` 帧时，decode 线程
+/// 短暂睡眠等待 render 线程消费，避免解码远超渲染导致 AVSync 大量丢帧。
+const MAX_VIDEO_BUFFER_FRAMES: usize = 8;
+
 pub fn video_decode_loop(
     pipeline: Arc<Pipeline>,
     mut decoder: Box<dyn VideoDecoder>,
@@ -16,6 +21,7 @@ pub fn video_decode_loop(
     tracing::info!("video_decode_loop started");
 
     let mut last_seek_gen: u64 = 0;
+    let mut frame_count: u64 = 0;
 
     loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
@@ -25,6 +31,12 @@ pub fn video_decode_loop(
         // 暂停检查
         if pipeline.is_paused() {
             std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+
+        // 节流：输出 buffer 过高时等待 render 线程消费
+        if video_frame_tx.len() >= MAX_VIDEO_BUFFER_FRAMES {
+            std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
 
@@ -48,6 +60,10 @@ pub fn video_decode_loop(
                 loop {
                     match decoder.receive_frame() {
                         Ok(Some(frame)) => {
+                            frame_count += 1;
+                            if frame_count.is_multiple_of(50) {
+                                tracing::info!("video_decode: decoded {} frames", frame_count);
+                            }
                             if video_frame_tx.send(frame).is_err() {
                                 tracing::debug!("video_frame_tx closed");
                                 return Ok(());
@@ -83,6 +99,7 @@ pub fn audio_decode_loop(
     tracing::info!("audio_decode_loop started");
 
     let mut last_seek_gen: u64 = 0;
+    let mut frame_count: u64 = 0;
 
     loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
@@ -114,6 +131,10 @@ pub fn audio_decode_loop(
                 loop {
                     match decoder.receive_frame() {
                         Ok(Some(frame)) => {
+                            frame_count += 1;
+                            if frame_count.is_multiple_of(100) {
+                                tracing::info!("audio_decode: decoded {} frames", frame_count);
+                            }
                             if audio_frame_tx.send(frame).is_err() {
                                 tracing::debug!("audio_frame_tx closed");
                                 return Ok(());

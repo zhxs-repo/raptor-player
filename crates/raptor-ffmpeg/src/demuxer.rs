@@ -26,12 +26,15 @@ pub trait Demuxer: Send {
 }
 
 /// FFmpeg 解复用器实现
+///
+/// 使用 `Packet::read()` API 直接读取数据包，无需 PacketIter 生命周期 transmute。
 pub struct FfmpegDemuxer {
-    input: Option<ffmpeg_next::format::context::Input>,
     info: Option<MediaInfo>,
     video_codec_context: Option<ffmpeg_next::codec::Context>,
     audio_codec_context: Option<ffmpeg_next::codec::Context>,
-    packet_iter: Option<ffmpeg_next::format::context::input::PacketIter<'static>>,
+    input: Option<ffmpeg_next::format::context::Input>,
+    /// 缓存每个流的 time_base，避免每个 packet 查找
+    time_bases: Vec<ffmpeg_next::Rational>,
 }
 
 // Safety: FfmpegDemuxer is only used from one thread at a time
@@ -40,11 +43,11 @@ unsafe impl Send for FfmpegDemuxer {}
 impl FfmpegDemuxer {
     pub fn new() -> Self {
         Self {
-            input: None,
             info: None,
             video_codec_context: None,
             audio_codec_context: None,
-            packet_iter: None,
+            input: None,
+            time_bases: Vec::new(),
         }
     }
 }
@@ -59,7 +62,7 @@ impl Demuxer for FfmpegDemuxer {
     fn open(&mut self, url: &str) -> Result<()> {
         tracing::info!("FfmpegDemuxer::open({})", url);
 
-        let mut input = ffmpeg_next::format::input(&url)
+        let input = ffmpeg_next::format::input(&url)
             .map_err(|e| RaptorError::Demux(format!("failed to open {}: {}", url, e)))?;
 
         // duration is in AV_TIME_BASE (microseconds)
@@ -169,39 +172,40 @@ impl Demuxer for FfmpegDemuxer {
 
         self.info = Some(info);
 
-        // Create packet iterator from input
-        // Safety: we transmute the lifetime to 'static, but we ensure the iterator
-        // is dropped before input by storing both in the same struct.
-        let iter = input.packets();
-        self.packet_iter = Some(unsafe {
-            std::mem::transmute::<
-                ffmpeg_next::format::context::input::PacketIter<'_>,
-                ffmpeg_next::format::context::input::PacketIter<'static>,
-            >(iter)
-        });
+        // 缓存每个流的 time_base
+        self.time_bases = input.streams().map(|s| s.time_base()).collect();
+
         self.input = Some(input);
         Ok(())
     }
 
     fn read_packet(&mut self) -> Result<Option<Packet>> {
-        let iter = self
-            .packet_iter
+        let input = self
+            .input
             .as_mut()
             .ok_or_else(|| RaptorError::InvalidState("demuxer not opened".into()))?;
 
-        match iter.next() {
-            Some((stream, packet)) => {
-                let time_base = stream.time_base();
+        let mut av_packet = ffmpeg_next::Packet::empty();
+        match av_packet.read(input) {
+            Ok(()) => {
+                let stream_idx = av_packet.stream();
+                let time_base = self
+                    .time_bases
+                    .get(stream_idx)
+                    .copied()
+                    .unwrap_or(ffmpeg_next::Rational::new(1, 90000));
+
                 let pkt = Packet {
-                    data: packet.data().unwrap_or_default().to_vec(),
-                    stream_index: stream.index(),
-                    pts: av_time_to_seconds(packet.pts().unwrap_or(0), time_base),
-                    dts: av_time_to_seconds(packet.dts().unwrap_or(0), time_base),
-                    is_key: packet.is_key(),
+                    data: av_packet.data().unwrap_or_default().to_vec(),
+                    stream_index: stream_idx,
+                    pts: av_time_to_seconds(av_packet.pts().unwrap_or(0), time_base),
+                    dts: av_time_to_seconds(av_packet.dts().unwrap_or(0), time_base),
+                    is_key: av_packet.is_key(),
                 };
                 Ok(Some(pkt))
             }
-            None => Ok(None), // EOF
+            Err(ffmpeg_next::Error::Eof) => Ok(None),
+            Err(e) => Err(RaptorError::Demux(format!("read_packet: {e}"))),
         }
     }
 
@@ -232,11 +236,11 @@ impl Demuxer for FfmpegDemuxer {
 
     fn close(&mut self) {
         tracing::info!("FfmpegDemuxer::close");
-        self.packet_iter = None;
         self.input = None;
         self.info = None;
         self.video_codec_context = None;
         self.audio_codec_context = None;
+        self.time_bases.clear();
     }
 }
 

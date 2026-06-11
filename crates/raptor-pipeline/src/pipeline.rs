@@ -6,9 +6,7 @@ use crossbeam_channel::{bounded, Sender};
 use parking_lot::Mutex;
 use raptor_audio::{AudioOutput, CpalOutput};
 use raptor_core::{AudioInfo, RaptorEvent, VideoInfo};
-use raptor_ffmpeg::{
-    AudioDecoder, Demuxer, FfmpegAudioDecoder, FfmpegDemuxer, FfmpegVideoDecoder, VideoDecoder,
-};
+use raptor_ffmpeg::{AudioDecoder, Demuxer, FfmpegAudioDecoder, FfmpegVideoDecoder, VideoDecoder};
 use raptor_render::VideoOutput;
 
 use crate::avsync::AVSync;
@@ -95,9 +93,12 @@ impl Pipeline {
     }
 
     /// 启动 pipeline — 创建 demux/decode/render/audio 线程
+    ///
+    /// 接受已打开的 demuxer，避免重复打开文件。
     pub fn start(
         &mut self,
         url: &str,
+        mut demuxer: Box<dyn Demuxer>,
         renderer: Box<dyn VideoOutput>,
         duration_secs: f64,
         video_info: Option<VideoInfo>,
@@ -119,10 +120,6 @@ impl Pipeline {
         self.seek_generation.store(0, Ordering::Release);
         self.position_us.store(0, Ordering::Release);
 
-        // 创建 Demuxer 并打开文件
-        let mut demuxer: Box<dyn Demuxer> = Box::new(FfmpegDemuxer::new());
-        demuxer.open(url)?;
-
         let info = demuxer
             .info()
             .cloned()
@@ -131,6 +128,7 @@ impl Pipeline {
         // 获取 codec contexts
         let video_codec_ctx = demuxer.take_video_codec_context();
         let audio_codec_ctx = demuxer.take_audio_codec_context();
+        let has_video = video_codec_ctx.is_some() || video_info.is_some();
 
         // 创建 channels
         let (video_pkt_tx, video_pkt_rx) = bounded::<raptor_ffmpeg::Packet>(512);
@@ -164,7 +162,7 @@ impl Pipeline {
         self.thread_handles.push(h);
 
         // 2. Video decode 线程
-        if video_codec_ctx.is_some() || video_info.is_some() {
+        if has_video {
             let video_decoder: Box<dyn VideoDecoder> = if let Some(ctx) = video_codec_ctx {
                 Box::new(FfmpegVideoDecoder::from_stream_context(ctx)?)
             } else {
@@ -211,7 +209,14 @@ impl Pipeline {
                 .name("raptor-render".into())
                 .spawn(move || {
                     Self::run_thread(|| {
-                        render_loop(p, renderer, video_frame_rx, event_tx, duration_secs)
+                        render_loop(
+                            p,
+                            renderer,
+                            video_frame_rx,
+                            event_tx,
+                            duration_secs,
+                            has_video,
+                        )
                     })
                     .unwrap_or_else(|e| tracing::error!("render thread error: {}", e));
                 })
@@ -221,21 +226,25 @@ impl Pipeline {
 
         // 5. Audio output 线程
         {
+            tracing::info!("Pipeline::start: creating audio output...");
             let mut audio_output: Box<dyn AudioOutput> = Box::new(CpalOutput::new());
             if let Some(ref ai) = audio_info {
                 audio_output.init(ai.sample_rate, ai.channels)?;
             } else if info.sample_rate > 0 {
                 audio_output.init(info.sample_rate, info.channels)?;
             }
+            tracing::info!("Pipeline::start: audio output initialized, spawning thread...");
             let p = pipeline.clone();
             let h = std::thread::Builder::new()
                 .name("raptor-audio".into())
                 .spawn(move || {
+                    tracing::info!("audio thread closure entered");
                     Self::run_thread(|| audio_output_loop(p, audio_output, audio_frame_rx))
                         .unwrap_or_else(|e| tracing::error!("audio thread error: {}", e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn audio: {e}")))?;
             self.thread_handles.push(h);
+            tracing::info!("Pipeline::start: audio thread spawned");
         }
 
         tracing::info!("Pipeline started: {} threads", self.thread_handles.len());
@@ -244,7 +253,10 @@ impl Pipeline {
 
     /// 停止 pipeline — 等待所有线程退出
     pub fn stop(&mut self) {
-        tracing::info!("Pipeline::stop");
+        tracing::info!(
+            "Pipeline::stop (thread_handles.len={})",
+            self.thread_handles.len()
+        );
         self.shutdown.store(true, Ordering::Release);
 
         // 取出 thread handles

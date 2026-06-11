@@ -102,7 +102,11 @@ impl VideoDecoder for FfmpegVideoDecoder {
                     planes.push(PlaneData { data, stride });
                 }
 
-                let pts = frame.pts().map(|p| p as f64 / 1_000_000.0).unwrap_or(0.0);
+                let time_base = decoder.packet_time_base();
+                let pts = frame
+                    .pts()
+                    .map(|p| av_time_to_seconds(p, time_base))
+                    .unwrap_or(0.0);
 
                 Ok(Some(VideoFrame {
                     pts,
@@ -193,7 +197,11 @@ impl AudioDecoder for FfmpegAudioDecoder {
         let mut frame = ffmpeg_next::frame::Audio::empty();
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
-                let pts = frame.pts().map(|p| p as f64 / 1_000_000.0).unwrap_or(0.0);
+                let time_base = decoder.packet_time_base();
+                let pts = frame
+                    .pts()
+                    .map(|p| av_time_to_seconds(p, time_base))
+                    .unwrap_or(0.0);
                 let samples = extract_audio_samples(&frame);
                 Ok(Some(AudioFrame {
                     pts,
@@ -220,18 +228,52 @@ fn is_eagain(err: &ffmpeg_next::Error) -> bool {
     matches!(err, ffmpeg_next::Error::Other { errno } if *errno == ffmpeg_next::error::EAGAIN)
 }
 
-/// 从 FFmpeg 音频帧提取 f32 采样（处理 planar/packed 格式）
+/// 从 FFmpeg 音频帧提取 f32 采样
+///
+/// 处理 planar（每声道独立 buffer）和 packed（声道交错在 data(0)）两种布局。
 fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
     let channels = frame.channels() as usize;
     let samples = frame.samples();
 
+    let format = frame.format();
+    let is_planar = matches!(
+        format,
+        ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar)
+            | ffmpeg_next::format::Sample::F64(ffmpeg_next::format::sample::Type::Planar)
+            | ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Planar)
+            | ffmpeg_next::format::Sample::I32(ffmpeg_next::format::sample::Type::Planar)
+            | ffmpeg_next::format::Sample::U8(ffmpeg_next::format::sample::Type::Planar)
+    );
+
     let mut output = Vec::with_capacity(samples * channels);
 
-    for s in 0..samples {
-        for c in 0..channels {
-            let data = frame.data(c);
-            if data.len() >= (s + 1) * 4 {
-                let offset = s * 4;
+    if is_planar {
+        // Planar: 每个声道有独立的 buffer，逐声道逐采样交错输出
+        for s in 0..samples {
+            for c in 0..channels {
+                let data = frame.data(c);
+                if data.len() >= (s + 1) * 4 {
+                    let offset = s * 4;
+                    let sample = f32::from_ne_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    output.push(sample);
+                } else {
+                    output.push(0.0);
+                }
+            }
+        }
+    } else {
+        // Packed: 所有声道交错存储在 data(0)
+        let data = frame.data(0);
+        let bytes_per_sample = 4; // f32 = 4 bytes
+        let total = samples * channels;
+        for i in 0..total {
+            let offset = i * bytes_per_sample;
+            if offset + bytes_per_sample <= data.len() {
                 let sample = f32::from_ne_bytes([
                     data[offset],
                     data[offset + 1],
@@ -244,6 +286,7 @@ fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
             }
         }
     }
+
     output
 }
 

@@ -21,13 +21,19 @@ pub fn render_loop(
     video_frame_rx: crossbeam_channel::Receiver<raptor_ffmpeg::VideoFrame>,
     event_tx: crossbeam_channel::Sender<RaptorEvent>,
     duration_secs: f64,
+    has_video: bool,
 ) -> raptor_core::Result<()> {
-    tracing::info!("render_loop started, duration={:.2}s", duration_secs);
+    tracing::info!(
+        "render_loop started, duration={:.2}s, has_video={}",
+        duration_secs,
+        has_video
+    );
 
     let mut render_start: Option<std::time::Instant> = None;
     let duration = Duration::from_secs_f64(duration_secs);
     let mut idle_count: u32 = 0;
     let mut first_frame = true;
+    let mut rendered_frames: u64 = 0;
 
     loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
@@ -64,6 +70,10 @@ pub fn render_loop(
 
                 match pipeline.avsync.video_sync_decision(frame.pts) {
                     VideoSyncDecision::Display => {
+                        rendered_frames += 1;
+                        if rendered_frames.is_multiple_of(30) {
+                            tracing::info!("render_loop: rendered {} frames", rendered_frames);
+                        }
                         pipeline
                             .position_us
                             .store((frame.pts * 1_000_000.0) as u64, Ordering::Release);
@@ -95,6 +105,10 @@ pub fn render_loop(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !has_video {
+                    // 纯音频文件：没有视频帧，仅保持窗口响应，等待 shutdown
+                    continue;
+                }
                 if pipeline.demux_complete.load(Ordering::Acquire) {
                     // demux 已完成且没有更多帧
                     if let Some(start) = render_start {

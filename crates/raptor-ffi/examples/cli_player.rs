@@ -2,6 +2,9 @@ use raptor_core::{Command, RaptorEvent};
 use raptor_ffi::Player;
 
 fn main() {
+    // 启用 backtrace 方便调试
+    std::env::set_var("RUST_BACKTRACE", "1");
+
     // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -9,6 +12,14 @@ fn main() {
                 .add_directive("raptor=info".parse().unwrap()),
         )
         .init();
+
+    // 自定义 panic hook：在 panic 时记录日志并包含 backtrace
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("\n=== PANIC: {} ===\n{}\n=== END PANIC ===\n", info, bt);
+        default_hook(info);
+    }));
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
