@@ -34,6 +34,7 @@ pub fn render_loop(
     let mut idle_count: u32 = 0;
     let mut first_frame = true;
     let mut rendered_frames: u64 = 0;
+    let mut dropped_frames: u64 = 0;
 
     loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
@@ -89,7 +90,19 @@ pub fn render_loop(
                         pipeline.avsync.update_video_clock(frame.pts);
                     }
                     VideoSyncDecision::Drop => {
-                        tracing::trace!("render_loop: drop frame pts={:.3}", frame.pts);
+                        dropped_frames += 1;
+                        if dropped_frames.is_multiple_of(30) {
+                            tracing::warn!(
+                                "render_loop: {} frames dropped (rendered={}, pts={:.3})",
+                                dropped_frames,
+                                rendered_frames,
+                                frame.pts
+                            );
+                        }
+                        // 即使丢帧也更新 position，让前端进度条持续推进
+                        pipeline
+                            .position_us
+                            .store((frame.pts * 1_000_000.0) as u64, Ordering::Release);
                     }
                 }
 
