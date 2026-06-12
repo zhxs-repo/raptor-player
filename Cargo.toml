@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.dependencies]
 # LTS locked
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "filter", "software-scaling", "software-resampling"] }
-wgpu = "0.20"
+wgpu = { version = "29", default-features = false, features = ["vulkan", "metal", "gles", "wgsl"] }
 cpal = "0.15"
 tokio = { version = "1", features = ["sync", "rt"] }
 crossbeam-channel = "0.5"

@@ -44,6 +44,8 @@ struct WindowRenderer {
     y_texture: wgpu::Texture,
     uv_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    window_size: (u32, u32),
+    last_frame: Option<VideoFrame>,
     window_should_close: bool,
     /// 共享标志：窗口关闭时设置为 true，供 WgpuRenderer 侧读取
     window_closed_flag: Arc<AtomicBool>,
@@ -66,13 +68,21 @@ impl WindowRenderer {
             .build(&event_loop)
             .map_err(|e| format!("window: {e}"))?;
 
+        let window_size = {
+            let s = window.inner_size();
+            (s.width.max(1), s.height.max(1))
+        };
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None,
         });
 
         let surface = unsafe {
-            wgpu::SurfaceTargetUnsafe::from_window(&window)
+            wgpu::SurfaceTargetUnsafe::from_display_and_window(&window, &window)
                 .map(|target| instance.create_surface_unsafe(target))
                 .map_err(|e| format!("surface target: {e}"))?
         }
@@ -83,15 +93,17 @@ impl WindowRenderer {
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
-        .ok_or_else(|| "no suitable GPU adapter".to_string())?;
+        .map_err(|_| "no suitable GPU adapter".to_string())?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("raptor_device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
+                experimental_features: Default::default(),
+                memory_hints: Default::default(),
+                trace: Default::default(),
             },
-            None,
         ))
         .map_err(|e| format!("device: {e}"))?;
 
@@ -112,8 +124,8 @@ impl WindowRenderer {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: width.max(1),
-            height: height.max(1),
+            width: window_size.0,
+            height: window_size.1,
             present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
@@ -144,6 +156,8 @@ impl WindowRenderer {
             y_texture,
             uv_texture,
             bind_group,
+            window_size,
+            last_frame: None,
             window_should_close: false,
             window_closed_flag: closed_flag,
         })
@@ -151,19 +165,33 @@ impl WindowRenderer {
 
     fn pump_events(&mut self) {
         let mut should_close = false;
+        let mut new_size: Option<(u32, u32)> = None;
         let _ =
             self.event_loop
                 .pump_events(Some(std::time::Duration::from_millis(5)), |event, _| {
-                    if let winit::event::Event::WindowEvent {
-                        event: winit::event::WindowEvent::CloseRequested,
-                        ..
-                    } = event
-                    {
-                        should_close = true;
+                    if let winit::event::Event::WindowEvent { event, .. } = event {
+                        match event {
+                            winit::event::WindowEvent::CloseRequested => {
+                                should_close = true;
+                            }
+                            winit::event::WindowEvent::Resized(size) => {
+                                new_size = Some((size.width.max(1), size.height.max(1)));
+                            }
+                            _ => {}
+                        }
                     }
                 });
         if should_close {
             self.window_should_close = true;
+        }
+        if let Some(size) = new_size {
+            self.window_size = size;
+            self.surface_config.width = size.0;
+            self.surface_config.height = size.1;
+            self.surface.configure(&self.device, &self.surface_config);
+            if let Some(frame) = self.last_frame.clone() {
+                self.render_frame_inner(&frame);
+            }
         }
     }
 
@@ -172,7 +200,13 @@ impl WindowRenderer {
         if self.window_should_close {
             return;
         }
+        self.last_frame = Some(frame.clone());
+        self.render_frame_inner(frame);
+    }
 
+    /// 实际渲染逻辑：上传纹理 + 计算 viewport + 绘制
+    fn render_frame_inner(&mut self, frame: &VideoFrame) {
+        // 视频分辨率变化 → 重建纹理（不影响 surface 尺寸）
         if frame.width != self.width || frame.height != self.height {
             self.width = frame.width;
             self.height = frame.height;
@@ -186,21 +220,19 @@ impl WindowRenderer {
             self.bind_group = bg;
             self.y_texture = yt;
             self.uv_texture = uvt;
-            self.surface_config.width = frame.width.max(1);
-            self.surface_config.height = frame.height.max(1);
-            self.surface.configure(&self.device, &self.surface_config);
         }
 
+        // 上传 Y 平面
         if let (Some(y_tex), Some(y_plane)) = (Some(&self.y_texture), frame.planes.first()) {
             self.queue.write_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: y_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 &y_plane.data,
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(y_plane.stride as u32),
                     rows_per_image: Some(frame.height),
@@ -213,19 +245,20 @@ impl WindowRenderer {
             );
         }
 
+        // 上传 UV 平面
         if let Some(uv_tex) = Some(&self.uv_texture) {
             match frame.format {
                 PixelFormat::Nv12 => {
                     if let Some(uv_plane) = frame.planes.get(1) {
                         self.queue.write_texture(
-                            wgpu::ImageCopyTexture {
+                            wgpu::TexelCopyTextureInfo {
                                 texture: uv_tex,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
                             &uv_plane.data,
-                            wgpu::ImageDataLayout {
+                            wgpu::TexelCopyBufferLayout {
                                 offset: 0,
                                 bytes_per_row: Some(uv_plane.stride as u32),
                                 rows_per_image: Some(frame.height / 2),
@@ -254,14 +287,14 @@ impl WindowRenderer {
                     let uv_interleaved =
                         interleave_uv_planes(u_data, u_stride, v_data, v_stride, uv_w, uv_h);
                     self.queue.write_texture(
-                        wgpu::ImageCopyTexture {
+                        wgpu::TexelCopyTextureInfo {
                             texture: uv_tex,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
                         &uv_interleaved,
-                        wgpu::ImageDataLayout {
+                        wgpu::TexelCopyBufferLayout {
                             offset: 0,
                             bytes_per_row: Some((uv_w * 2) as u32),
                             rows_per_image: Some(frame.height / 2),
@@ -276,20 +309,40 @@ impl WindowRenderer {
             }
         }
 
+        // 获取 surface 纹理
         let surface_texture = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return;
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                tracing::error!("GPU out of memory");
+            wgpu::CurrentSurfaceTexture::Lost => {
+                tracing::error!("GPU surface lost");
                 return;
             }
-            Err(e) => {
-                tracing::warn!("surface texture error: {}", e);
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                tracing::warn!("surface texture unavailable");
                 return;
             }
+        };
+
+        // 计算保持视频比例的 viewport（letterbox / pillarbox）
+        let surf_w = surface_texture.texture.width() as f32;
+        let surf_h = surface_texture.texture.height() as f32;
+        let video_w = self.width as f32;
+        let video_h = self.height as f32;
+        let viewport = if video_w > 0.0 && video_h > 0.0 {
+            let scale = (surf_w / video_w).min(surf_h / video_h);
+            let vp_w = (video_w * scale).round();
+            let vp_h = (video_h * scale).round();
+            let vp_x = ((surf_w - vp_w) / 2.0).round();
+            let vp_y = ((surf_h - vp_h) / 2.0).round();
+            (vp_x, vp_y, vp_w, vp_h)
+        } else {
+            (0.0, 0.0, surf_w, surf_h)
         };
 
         let view = surface_texture
@@ -303,6 +356,7 @@ impl WindowRenderer {
                 label: Some("yuv_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -314,6 +368,7 @@ impl WindowRenderer {
             });
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_viewport(viewport.0, viewport.1, viewport.2, viewport.3, 0.0, 1.0);
             pass.draw(0..4, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -425,21 +480,21 @@ impl WindowRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("yuv_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("yuv_render_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: None,
@@ -458,7 +513,8 @@ impl WindowRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
         (render_pipeline, bind_group, y_texture, uv_texture)
     }
