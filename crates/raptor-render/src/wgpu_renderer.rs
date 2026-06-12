@@ -102,15 +102,22 @@ impl WindowRenderer {
             .copied()
             .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
 
+        // 优先使用 Mailbox（无 vsync 阻塞、低延迟），不可用时回退到 FIFO
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: width.max(1),
             height: height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 
@@ -493,7 +500,7 @@ impl WindowRenderer {
 pub struct WgpuRenderer {
     width: u32,
     height: u32,
-    cmd_tx: Option<mpsc::Sender<WindowCmd>>,
+    cmd_tx: Option<mpsc::SyncSender<WindowCmd>>,
     /// 共享标志：窗口线程在窗口关闭时设置为 true，外部通过 should_stop() 读取
     window_closed: Arc<AtomicBool>,
     initialized: bool,
@@ -524,7 +531,7 @@ impl VideoOutput for WgpuRenderer {
         tracing::info!("WgpuRenderer::init({}x{})", width, height);
         self.width = width;
         self.height = height;
-        let (cmd_tx, cmd_rx) = mpsc::channel::<WindowCmd>();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<WindowCmd>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let closed_flag = Arc::clone(&self.window_closed);
         std::thread::Builder::new()
@@ -555,8 +562,16 @@ impl VideoOutput for WgpuRenderer {
             return Ok(());
         }
         if let Some(tx) = &self.cmd_tx {
-            if tx.send(WindowCmd::Frame(frame.clone())).is_err() {
-                self.window_closed.store(true, Ordering::Release);
+            // 使用 try_send 避免无界队列内存增长；
+            // 队列满时说明窗口线程消费不及时，丢弃该帧以施加反压
+            match tx.try_send(WindowCmd::Frame(frame.clone())) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    tracing::debug!("submit_frame: channel full, dropping frame");
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.window_closed.store(true, Ordering::Release);
+                }
             }
         }
         Ok(())

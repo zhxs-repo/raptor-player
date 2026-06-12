@@ -36,7 +36,7 @@ pub fn render_loop(
     let mut rendered_frames: u64 = 0;
     let mut dropped_frames: u64 = 0;
 
-    loop {
+    'outer: loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
             tracing::info!("render_loop: shutdown");
             break;
@@ -81,8 +81,31 @@ pub fn render_loop(
                         let _ = renderer.submit_frame(&frame);
                         pipeline.avsync.update_video_clock(frame.pts);
                     }
-                    VideoSyncDecision::Wait(secs) => {
-                        std::thread::sleep(Duration::from_secs_f64(secs));
+                    VideoSyncDecision::Wait(mut secs) => {
+                        // sleep 后重新决策：若主时钟已超前很多，该帧可能已过时
+                        let mut attempts = 0;
+                        loop {
+                            std::thread::sleep(Duration::from_secs_f64(secs));
+                            match pipeline.avsync.video_sync_decision(frame.pts) {
+                                VideoSyncDecision::Display => break,
+                                VideoSyncDecision::Wait(s) => {
+                                    secs = s;
+                                    attempts += 1;
+                                    if attempts >= 3 {
+                                        // 避免无限等待，强制显示
+                                        break;
+                                    }
+                                }
+                                VideoSyncDecision::Drop => {
+                                    dropped_frames += 1;
+                                    pipeline
+                                        .position_us
+                                        .store((frame.pts * 1_000_000.0) as u64, Ordering::Release);
+                                    // 跳过渲染，直接进入下一帧
+                                    continue 'outer;
+                                }
+                            }
+                        }
                         pipeline
                             .position_us
                             .store((frame.pts * 1_000_000.0) as u64, Ordering::Release);
