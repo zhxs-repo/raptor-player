@@ -6,13 +6,14 @@ use raptor_ffmpeg::{Demuxer, Packet};
 
 use crate::pipeline::Pipeline;
 
-/// Demux loop — 从 Demuxer 读取 Packet，分发到视频/音频解码通道
+/// Demux loop — 从 Demuxer 读取 Packet，分发到视频/音频/字幕解码通道
 #[allow(clippy::collapsible_if)]
 pub fn demux_loop(
     pipeline: Arc<Pipeline>,
     mut demuxer: Box<dyn Demuxer>,
     video_pkt_tx: Sender<Packet>,
     audio_pkt_tx: Sender<Packet>,
+    subtitle_pkt_tx: Option<Sender<Packet>>,
 ) -> raptor_core::Result<()> {
     tracing::info!("demux_loop started");
 
@@ -76,6 +77,13 @@ pub fn demux_loop(
                     if audio_pkt_tx.send(pkt).is_err() {
                         tracing::debug!("demux: audio_pkt_tx closed");
                         break;
+                    }
+                } else if Some(stream_idx) == info.subtitle_stream_index {
+                    if let Some(ref tx) = subtitle_pkt_tx {
+                        if tx.send(pkt).is_err() {
+                            tracing::debug!("demux: subtitle_pkt_tx closed");
+                            break;
+                        }
                     }
                 }
             }

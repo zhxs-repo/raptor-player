@@ -13,8 +13,6 @@ use crate::pipeline::Pipeline;
 const END_IDLE_LIMIT: u32 = 20; // ~1s at 50ms/cycle
 
 /// Video render loop — 从 video_frame_rx 接收帧，经 AV 同步后提交到 VideoOutput
-///
-/// 使用**挂钟时间**判断播放结束：记录首帧显示时刻，当经过时间 >= 文件时长时发送 EndFile。
 pub fn render_loop(
     pipeline: Arc<Pipeline>,
     mut renderer: Box<dyn VideoOutput>,
@@ -22,6 +20,8 @@ pub fn render_loop(
     event_tx: crossbeam_channel::Sender<RaptorEvent>,
     duration_secs: f64,
     has_video: bool,
+    video_info: Option<raptor_core::VideoInfo>,
+    audio_info: Option<raptor_core::AudioInfo>,
 ) -> raptor_core::Result<()> {
     tracing::info!(
         "render_loop started, duration={:.2}s, has_video={}",
@@ -35,6 +35,20 @@ pub fn render_loop(
     let mut first_frame = true;
     let mut rendered_frames: u64 = 0;
     let mut dropped_frames: u64 = 0;
+    let mut last_hud_update = std::time::Instant::now();
+
+    let video_codec = video_info.as_ref().map(|v| v.codec.clone()).unwrap_or_default();
+    let video_w = video_info.as_ref().map(|v| v.width).unwrap_or(0);
+    let video_h = video_info.as_ref().map(|v| v.height).unwrap_or(0);
+    let video_fps = video_info.as_ref().map(|v| v.fps).unwrap_or(0.0);
+    let audio_codec = audio_info.as_ref().map(|a| a.codec.clone()).unwrap_or_default();
+    let audio_desc = if audio_codec.is_empty() {
+        String::new()
+    } else {
+        let ch = audio_info.as_ref().map(|a| a.channels).unwrap_or(0);
+        let sr = audio_info.as_ref().map(|a| a.sample_rate).unwrap_or(0);
+        format!(" | {} {}ch {}Hz", audio_codec, ch, sr)
+    };
 
     'outer: loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
@@ -138,6 +152,23 @@ pub fn render_loop(
                         });
                         break;
                     }
+                }
+
+                // 定期更新 HUD 标题栏（每 500ms）
+                if last_hud_update.elapsed() >= std::time::Duration::from_millis(500) {
+                    last_hud_update = std::time::Instant::now();
+                    let pos = pipeline.current_position_secs();
+                    let status = if pipeline.is_paused() { "PAUSE" } else { "PLAY" };
+                    let title = format!(
+                        "Raptor | {} | {} {}x{} {:.1}fps | SW | {}/{:.0}s | F:{} D:{}{}",
+                        status,
+                        if video_codec.is_empty() { "-".to_string() } else { video_codec.clone() },
+                        video_w, video_h, video_fps,
+                        pos, duration_secs,
+                        rendered_frames, dropped_frames,
+                        audio_desc,
+                    );
+                    renderer.set_title(&title);
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {

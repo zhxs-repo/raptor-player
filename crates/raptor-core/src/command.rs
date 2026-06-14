@@ -19,6 +19,16 @@ pub enum Command {
     Seek { target: f64, mode: SeekMode },
     /// 设置音量 (0-100)
     SetVolume { volume: u8 },
+    /// 加载字幕文件（SRT/ASS/SSA）
+    LoadSubtitle { path: String },
+    /// 切换字幕显示/隐藏
+    ToggleSubtitle,
+    /// 加载弹幕文件（B站XML/JSON）
+    LoadDanmaku { path: String },
+    /// 切换弹幕显示/隐藏
+    ToggleDanmaku,
+    /// 设置弹幕不透明度 (0-100)
+    SetDanmakuOpacity { opacity: u8 },
     /// 退出
     Quit,
 }

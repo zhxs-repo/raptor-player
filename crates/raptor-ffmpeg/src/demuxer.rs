@@ -21,6 +21,9 @@ pub trait Demuxer: Send {
     /// 获取音频流的 CodecContext
     fn take_audio_codec_context(&mut self) -> Option<ffmpeg_next::codec::Context>;
 
+    /// 获取字幕流的 CodecContext
+    fn take_subtitle_codec_context(&mut self) -> Option<ffmpeg_next::codec::Context>;
+
     /// 关闭文件
     fn close(&mut self);
 }
@@ -32,6 +35,7 @@ pub struct FfmpegDemuxer {
     info: Option<MediaInfo>,
     video_codec_context: Option<ffmpeg_next::codec::Context>,
     audio_codec_context: Option<ffmpeg_next::codec::Context>,
+    subtitle_codec_context: Option<ffmpeg_next::codec::Context>,
     input: Option<ffmpeg_next::format::context::Input>,
     /// 缓存每个流的 time_base，避免每个 packet 查找
     time_bases: Vec<ffmpeg_next::Rational>,
@@ -46,6 +50,7 @@ impl FfmpegDemuxer {
             info: None,
             video_codec_context: None,
             audio_codec_context: None,
+            subtitle_codec_context: None,
             input: None,
             time_bases: Vec::new(),
         }
@@ -69,12 +74,14 @@ impl Demuxer for FfmpegDemuxer {
         let duration = input.duration() as f64 / 1_000_000.0;
         let mut video_stream_index = None;
         let mut audio_stream_index = None;
+        let mut subtitle_stream_index = None;
         let mut width = 0u32;
         let mut height = 0u32;
         let mut pixel_format = PixelFormat::Unknown;
         let mut fps = 0.0;
         let mut video_codec_id = None;
         let mut audio_codec_id = None;
+        let mut subtitle_codec_id = None;
         let mut sample_rate = 0u32;
         let mut channels = 0u32;
         let mut sample_format = SampleFormat::Unknown;
@@ -126,6 +133,20 @@ impl Demuxer for FfmpegDemuxer {
                         .map_err(|e| RaptorError::Demux(format!("audio context: {e}")))?;
                     self.audio_codec_context = Some(ctx);
                 }
+                ffmpeg_next::media::Type::Subtitle if subtitle_stream_index.is_none() => {
+                    subtitle_stream_index = Some(i);
+                    subtitle_codec_id = Some(SubtitleCodecId::from(params.id()));
+
+                    let ctx = ffmpeg_next::codec::Context::from_parameters(params)
+                        .map_err(|e| RaptorError::Demux(format!("subtitle context: {e}")))?;
+                    self.subtitle_codec_context = Some(ctx);
+
+                    tracing::info!(
+                        "demuxer: detected subtitle stream {} ({:?})",
+                        i,
+                        subtitle_codec_id
+                    );
+                }
                 _ => {}
             }
         }
@@ -134,8 +155,10 @@ impl Demuxer for FfmpegDemuxer {
             duration,
             video_stream_index,
             audio_stream_index,
+            subtitle_stream_index,
             video_codec_id,
             audio_codec_id,
+            subtitle_codec_id,
             width,
             height,
             pixel_format,
@@ -234,12 +257,17 @@ impl Demuxer for FfmpegDemuxer {
         self.audio_codec_context.take()
     }
 
+    fn take_subtitle_codec_context(&mut self) -> Option<ffmpeg_next::codec::Context> {
+        self.subtitle_codec_context.take()
+    }
+
     fn close(&mut self) {
         tracing::info!("FfmpegDemuxer::close");
         self.input = None;
         self.info = None;
         self.video_codec_context = None;
         self.audio_codec_context = None;
+        self.subtitle_codec_context = None;
         self.time_bases.clear();
     }
 }

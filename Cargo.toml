@@ -4,6 +4,8 @@ members = [
     "crates/raptor-ffmpeg",
     "crates/raptor-render",
     "crates/raptor-audio",
+    "crates/raptor-danmaku",
+    "crates/raptor-subtitle",
     "crates/raptor-pipeline",
     "crates/raptor-ffi",
 ]

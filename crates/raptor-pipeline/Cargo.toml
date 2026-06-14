@@ -9,6 +9,8 @@ raptor-core = { path = "../raptor-core" }
 raptor-ffmpeg = { path = "../raptor-ffmpeg" }
 raptor-render = { path = "../raptor-render" }
 raptor-audio = { path = "../raptor-audio" }
+raptor-subtitle = { path = "../raptor-subtitle" }
+raptor-danmaku = { path = "../raptor-danmaku" }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }

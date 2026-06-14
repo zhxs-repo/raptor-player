@@ -6,5 +6,5 @@ pub use decoder::{AudioDecoder, FfmpegAudioDecoder, FfmpegVideoDecoder, VideoDec
 pub use demuxer::{Demuxer, FfmpegDemuxer};
 pub use types::{
     AudioCodecId, AudioFrame, MediaInfo, Packet, PixelFormat, PlaneData, SampleFormat,
-    VideoCodecId, VideoFrame,
+    SubtitleCodecId, VideoCodecId, VideoFrame,
 };

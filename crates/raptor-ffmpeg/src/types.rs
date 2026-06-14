@@ -189,14 +189,40 @@ pub struct Packet {
     pub is_key: bool,
 }
 
+/// 字幕编解码器 ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubtitleCodecId {
+    /// 文本字幕（SRT / SubRip）
+    SubRip,
+    /// MP4 容器内文本字幕
+    MovText,
+    /// ASS/SSA 字幕
+    Ass,
+    /// 其他 / 未知
+    Unknown,
+}
+
+impl From<ffmpeg_next::codec::Id> for SubtitleCodecId {
+    fn from(id: ffmpeg_next::codec::Id) -> Self {
+        match id {
+            ffmpeg_next::codec::Id::SUBRIP => SubtitleCodecId::SubRip,
+            ffmpeg_next::codec::Id::MOV_TEXT => SubtitleCodecId::MovText,
+            ffmpeg_next::codec::Id::ASS => SubtitleCodecId::Ass,
+            _ => SubtitleCodecId::Unknown,
+        }
+    }
+}
+
 /// 媒体文件信息
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
     pub duration: f64,
     pub video_stream_index: Option<usize>,
     pub audio_stream_index: Option<usize>,
+    pub subtitle_stream_index: Option<usize>,
     pub video_codec_id: Option<VideoCodecId>,
     pub audio_codec_id: Option<AudioCodecId>,
+    pub subtitle_codec_id: Option<SubtitleCodecId>,
     pub width: u32,
     pub height: u32,
     pub pixel_format: PixelFormat,

@@ -8,11 +8,13 @@ use raptor_audio::{AudioOutput, CpalOutput};
 use raptor_core::{AudioInfo, RaptorEvent, VideoInfo};
 use raptor_ffmpeg::{AudioDecoder, Demuxer, FfmpegAudioDecoder, FfmpegVideoDecoder, VideoDecoder};
 use raptor_render::VideoOutput;
+use raptor_subtitle::SubtitleEngine;
 
 use crate::avsync::AVSync;
 use crate::decode::{audio_decode_loop, video_decode_loop};
 use crate::demux::demux_loop;
 use crate::output::{audio_output_loop, render_loop};
+use crate::subtitle::subtitle_decode_loop;
 
 /// Seek 请求
 pub struct SeekRequest {
@@ -92,9 +94,10 @@ impl Pipeline {
         self.volume.load(Ordering::Relaxed)
     }
 
-    /// 启动 pipeline — 创建 demux/decode/render/audio 线程
+    /// 启动 pipeline — 创建 demux/decode/render/audio/subtitle 线程
     ///
     /// 接受已打开的 demuxer，避免重复打开文件。
+    /// `subtitle_engine` 用于内嵌字幕流的解码和渲染。
     pub fn start(
         &mut self,
         url: &str,
@@ -103,6 +106,7 @@ impl Pipeline {
         duration_secs: f64,
         video_info: Option<VideoInfo>,
         audio_info: Option<AudioInfo>,
+        subtitle_engine: Option<Arc<Mutex<SubtitleEngine>>>,
     ) -> raptor_core::Result<()> {
         tracing::info!(
             "Pipeline::start: url={}, duration={:.2}s",
@@ -128,13 +132,23 @@ impl Pipeline {
         // 获取 codec contexts
         let video_codec_ctx = demuxer.take_video_codec_context();
         let audio_codec_ctx = demuxer.take_audio_codec_context();
+        let _subtitle_codec_ctx = demuxer.take_subtitle_codec_context();
         let has_video = video_codec_ctx.is_some() || video_info.is_some();
+        let has_subtitle = info.subtitle_stream_index.is_some() && subtitle_engine.is_some();
 
         // 创建 channels
         let (video_pkt_tx, video_pkt_rx) = bounded::<raptor_ffmpeg::Packet>(512);
         let (audio_pkt_tx, audio_pkt_rx) = bounded::<raptor_ffmpeg::Packet>(1024);
         let (video_frame_tx, video_frame_rx) = bounded::<raptor_ffmpeg::VideoFrame>(32);
         let (audio_frame_tx, audio_frame_rx) = bounded::<raptor_ffmpeg::AudioFrame>(64);
+
+        // 字幕 packet channel（仅在有内嵌字幕时创建）
+        let (subtitle_pkt_tx, subtitle_pkt_rx) = if has_subtitle {
+            let (tx, rx) = bounded::<raptor_ffmpeg::Packet>(256);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         let pipeline = Arc::new(Pipeline {
             avsync: self.avsync.clone(),
@@ -155,8 +169,10 @@ impl Pipeline {
         let h = std::thread::Builder::new()
             .name("raptor-demux".into())
             .spawn(move || {
-                Self::run_thread(|| demux_loop(p, demuxer, video_pkt_tx, audio_pkt_tx))
-                    .unwrap_or_else(|e| tracing::error!("demux thread error: {}", e));
+                Self::run_thread(|| {
+                    demux_loop(p, demuxer, video_pkt_tx, audio_pkt_tx, subtitle_pkt_tx)
+                })
+                .unwrap_or_else(|e| tracing::error!("demux thread error: {}", e));
             })
             .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn demux: {e}")))?;
         self.thread_handles.push(h);
@@ -205,6 +221,8 @@ impl Pipeline {
         {
             let p = pipeline.clone();
             let event_tx = self.event_tx.clone();
+            let vi = video_info.clone();
+            let ai = audio_info.clone();
             let h = std::thread::Builder::new()
                 .name("raptor-render".into())
                 .spawn(move || {
@@ -216,6 +234,8 @@ impl Pipeline {
                             event_tx,
                             duration_secs,
                             has_video,
+                            vi,
+                            ai,
                         )
                     })
                     .unwrap_or_else(|e| tracing::error!("render thread error: {}", e));
@@ -245,6 +265,30 @@ impl Pipeline {
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn audio: {e}")))?;
             self.thread_handles.push(h);
             tracing::info!("Pipeline::start: audio thread spawned");
+        }
+
+        // 6. Subtitle decode 线程（仅在有内嵌字幕时启动）
+        if let (Some(subtitle_pkt_rx), Some(sub_engine)) = (subtitle_pkt_rx, subtitle_engine) {
+            let is_text_subtitle = info.subtitle_codec_id.map_or(false, |id| {
+                matches!(
+                    id,
+                    raptor_ffmpeg::SubtitleCodecId::MovText
+                        | raptor_ffmpeg::SubtitleCodecId::SubRip
+                        | raptor_ffmpeg::SubtitleCodecId::Ass
+                )
+            });
+            let p = pipeline.clone();
+            let h = std::thread::Builder::new()
+                .name("raptor-subtitle".into())
+                .spawn(move || {
+                    Self::run_thread(|| {
+                        subtitle_decode_loop(p, subtitle_pkt_rx, sub_engine, is_text_subtitle)
+                    })
+                    .unwrap_or_else(|e| tracing::error!("subtitle thread error: {}", e));
+                })
+                .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn subtitle: {e}")))?;
+            self.thread_handles.push(h);
+            tracing::info!("Pipeline::start: subtitle thread spawned");
         }
 
         tracing::info!("Pipeline started: {} threads", self.thread_handles.len());

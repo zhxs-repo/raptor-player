@@ -13,6 +13,8 @@ raptor-ffmpeg = { path = "../raptor-ffmpeg" }
 raptor-render = { path = "../raptor-render" }
 raptor-audio = { path = "../raptor-audio" }
 raptor-pipeline = { path = "../raptor-pipeline" }
+raptor-subtitle = { path = "../raptor-subtitle" }
+raptor-danmaku = { path = "../raptor-danmaku" }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }

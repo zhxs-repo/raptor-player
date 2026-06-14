@@ -1,3 +1,4 @@
+use crate::overlay::OverlayStack;
 use raptor_core::Result;
 use raptor_ffmpeg::{PixelFormat, VideoFrame};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,6 +8,24 @@ use winit::platform::pump_events::EventLoopExtPumpEvents;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::WindowBuilder;
+
+/// HUD 播放统计 — 用于窗口标题栏显示
+#[derive(Debug, Clone, Default)]
+pub struct HudStats {
+    pub paused: bool,
+    pub video_codec: String,
+    pub audio_codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub rendered_frames: u64,
+    pub dropped_frames: u64,
+    pub subtitle_on: bool,
+    pub danmaku_on: bool,
+    pub danmaku_count: u32,
+}
 
 /// VideoOutput trait — 视频输出抽象
 pub trait VideoOutput: Send {
@@ -23,10 +42,14 @@ pub trait VideoOutput: Send {
         false
     }
     fn poll(&mut self) {}
+    /// 更新窗口标题（用于 HUD 信息显示）
+    fn set_title(&mut self, _title: &str) {}
 }
 
 enum WindowCmd {
     Frame(VideoFrame),
+    SetOverlays(Vec<Box<dyn crate::overlay::Overlay>>),
+    SetTitle(String),
     Shutdown,
 }
 
@@ -47,8 +70,11 @@ struct WindowRenderer {
     window_size: (u32, u32),
     last_frame: Option<VideoFrame>,
     window_should_close: bool,
+    title: String,
     /// 共享标志：窗口关闭时设置为 true，供 WgpuRenderer 侧读取
     window_closed_flag: Arc<AtomicBool>,
+    /// Overlay 合成栈（字幕、弹幕等叠加层）
+    overlay_stack: OverlayStack,
 }
 
 impl WindowRenderer {
@@ -159,7 +185,9 @@ impl WindowRenderer {
             window_size,
             last_frame: None,
             window_should_close: false,
+            title: "Raptor Player".to_string(),
             window_closed_flag: closed_flag,
+            overlay_stack: OverlayStack::new(),
         })
     }
 
@@ -183,6 +211,9 @@ impl WindowRenderer {
                 });
         if should_close {
             self.window_should_close = true;
+        }
+        if self.title != "Raptor Player" {
+            self.window.set_title(&self.title);
         }
         if let Some(size) = new_size {
             self.window_size = size;
@@ -371,6 +402,22 @@ impl WindowRenderer {
             pass.set_viewport(viewport.0, viewport.1, viewport.2, viewport.3, 0.0, 1.0);
             pass.draw(0..4, 0..1);
         }
+        // 渲染所有 Overlay 叠加层（字幕、弹幕等）
+        // 在 video pass 之后、present 之前执行
+        let current_pts = frame.pts;
+        self.overlay_stack.update_all(current_pts);
+        if !self.overlay_stack.is_empty() {
+            self.overlay_stack.render_all(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                self.surface_config.format,
+                surface_texture.texture.width(),
+                surface_texture.texture.height(),
+            );
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
     }
@@ -535,6 +582,20 @@ impl WindowRenderer {
                         break;
                     }
                 }
+                Ok(WindowCmd::SetOverlays(overlays)) => {
+                    self.overlay_stack = OverlayStack::new();
+                    for overlay in overlays {
+                        self.overlay_stack.push(overlay);
+                    }
+                    tracing::info!(
+                        "WindowRenderer: overlay stack updated ({} overlays)",
+                        self.overlay_stack.len()
+                    );
+                }
+                Ok(WindowCmd::SetTitle(title)) => {
+                    self.title = title.clone();
+                    self.window.set_title(&title);
+                }
                 Ok(WindowCmd::Shutdown) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.pump_events();
@@ -572,6 +633,16 @@ impl WgpuRenderer {
             cmd_tx: None,
             window_closed: Arc::new(AtomicBool::new(false)),
             initialized: false,
+        }
+    }
+
+    /// 设置 Overlay 叠加层（字幕、弹幕等）
+    ///
+    /// 将 overlays 发送到窗口线程，替换当前的 overlay 栈。
+    /// 在 pipeline 启动后调用，确保窗口线程已就绪。
+    pub fn set_overlays(&self, overlays: Vec<Box<dyn crate::overlay::Overlay>>) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.try_send(WindowCmd::SetOverlays(overlays));
         }
     }
 }
@@ -650,6 +721,12 @@ impl VideoOutput for WgpuRenderer {
     /// 窗口线程的 recv_timeout(16ms) 已保证每 16ms 泵一次事件，无需外部触发。
     fn poll(&mut self) {
         // 无操作 — 窗口线程自行泵事件
+    }
+
+    fn set_title(&mut self, title: &str) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.try_send(WindowCmd::SetTitle(title.to_string()));
+        }
     }
 }
 

@@ -15,9 +15,11 @@ use raptor_core::{
     Command, CommandResult, DefaultPropertyStore, ErrorCode, MediaInfo, PlayerEvent, PlayerState,
     PropertyStore, PropertyValue, RaptorError, RaptorEvent, SeekMode,
 };
+use raptor_danmaku::{DanmakuConfig, DanmakuEngine};
 use raptor_ffmpeg::{Demuxer, FfmpegDemuxer};
 use raptor_pipeline::{Pipeline, PipelineHandles};
-use raptor_render::{VideoOutput, WgpuRenderer};
+use raptor_render::{SharedOverlay, VideoOutput, WgpuRenderer};
+use raptor_subtitle::{SubtitleConfig, SubtitleEngine};
 
 /// 播放器核心 — 持有状态机 + pipeline + 属性存储
 pub struct Player {
@@ -28,6 +30,10 @@ pub struct Player {
     pipeline_handles: Mutex<Option<PipelineHandles>>,
     /// 位置上报后台线程（定期将 pipeline position 写入 property store）
     position_reporter: Mutex<Option<JoinHandle<()>>>,
+    /// 字幕引擎（SharedOverlay 包装，与渲染线程共享）
+    subtitle_engine: Mutex<Option<Arc<Mutex<SubtitleEngine>>>>,
+    /// 弹幕引擎（SharedOverlay 包装，与渲染线程共享）
+    danmaku_engine: Mutex<Option<Arc<Mutex<DanmakuEngine>>>>,
 }
 
 impl Player {
@@ -40,6 +46,8 @@ impl Player {
             pipeline: Mutex::new(None),
             pipeline_handles: Mutex::new(None),
             position_reporter: Mutex::new(None),
+            subtitle_engine: Mutex::new(None),
+            danmaku_engine: Mutex::new(None),
         }
     }
 
@@ -55,9 +63,23 @@ impl Player {
             Command::SetVolume { volume } => {
                 self.properties
                     .set("volume", PropertyValue::Int(volume as i64));
-                // 同步传递到 pipeline 音频输出
                 if let Some(pipeline) = self.pipeline.lock().as_ref() {
                     pipeline.set_volume(volume);
+                }
+                Ok(CommandResult::Empty)
+            }
+            Command::LoadSubtitle { path } => self.load_subtitle(&path),
+            Command::ToggleSubtitle => self.toggle_subtitle(),
+            Command::LoadDanmaku { path } => self.load_danmaku(&path),
+            Command::ToggleDanmaku => self.toggle_danmaku(),
+            Command::SetDanmakuOpacity { opacity } => {
+                if let Some(engine) = self.danmaku_engine.lock().as_ref() {
+                    let shared = engine.lock().shared_state();
+                    let mut state = shared.lock();
+                    // opacity 是 0-100 的 u8，转换为 0.0-1.0
+                    state.opacity = opacity as f32 / 100.0;
+                    self.properties
+                        .set("danmaku_opacity", PropertyValue::Int(opacity as i64));
                 }
                 Ok(CommandResult::Empty)
             }
@@ -121,6 +143,28 @@ impl Player {
             renderer.init(vi.width, vi.height)?;
         }
 
+        // 创建字幕和弹幕引擎，并通过 SharedOverlay 包装后设置到渲染器
+        let subtitle_engine = Arc::new(Mutex::new(SubtitleEngine::new(SubtitleConfig::default())));
+        let danmaku_engine = Arc::new(Mutex::new(DanmakuEngine::new(DanmakuConfig::default())));
+
+        // 自动加载系统字体（供字幕和弹幕光栅化文本使用）
+        if let Some(font_data) = raptor_subtitle::load_system_font() {
+            subtitle_engine.lock().set_font(font_data.clone());
+            danmaku_engine.lock().set_font(font_data);
+            tracing::info!("load_file: system font loaded for subtitle/danmaku engines");
+        }
+
+        // 在 renderer 被移入 pipeline 之前设置 overlays
+        let overlays: Vec<Box<dyn raptor_render::Overlay>> = vec![
+            Box::new(SharedOverlay::new(subtitle_engine.clone())),
+            Box::new(SharedOverlay::new(danmaku_engine.clone())),
+        ];
+        renderer.set_overlays(overlays);
+
+        // 存储引擎引用（供后续 LoadSubtitle / LoadDanmaku 命令使用）
+        *self.subtitle_engine.lock() = Some(subtitle_engine);
+        *self.danmaku_engine.lock() = Some(danmaku_engine);
+
         // 创建 pipeline（暂停状态）— 将 demuxer 传递给 pipeline，避免重复打开文件
         let (crossbeam_tx, crossbeam_rx) = crossbeam_channel::bounded(64);
         let mut pipeline = Pipeline::new(crossbeam_tx);
@@ -133,6 +177,7 @@ impl Player {
             duration,
             video_info.clone(),
             audio_info.clone(),
+            self.subtitle_engine.lock().clone(),
         ) {
             Ok(()) => tracing::info!("load_file: pipeline.start() returned Ok"),
             Err(e) => {
@@ -278,11 +323,11 @@ impl Player {
     }
 
     fn stop_pipeline(&self) {
-        // 停止位置上报
+        // 停止位置报备
         if let Some(handle) = self.position_reporter.lock().take() {
             let _ = handle.join();
         }
-
+    
         if let Some(pipeline) = self.pipeline.lock().take() {
             // 需要获取可变引用来调用 stop
             if let Some(p) = Arc::into_inner(pipeline) {
@@ -291,6 +336,10 @@ impl Player {
             }
         }
         *self.pipeline_handles.lock() = None;
+    
+        // 清除字幕/弹幕引擎引用
+        *self.subtitle_engine.lock() = None;
+        *self.danmaku_engine.lock() = None;
     }
 
     fn start_position_reporter(&self, pipeline: Arc<Pipeline>) {
@@ -316,6 +365,105 @@ impl Player {
             .expect("spawn position reporter");
 
         *self.position_reporter.lock() = Some(handle);
+    }
+
+    fn load_subtitle(&self, path: &str) -> raptor_core::Result<CommandResult> {
+        let engine = self
+            .subtitle_engine
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| raptor_core::RaptorError::Internal("subtitle engine not initialized".into()))?;
+
+        engine.lock().load_from_file(path)?;
+        self.properties.set("subtitle_enabled", PropertyValue::Bool(true));
+        tracing::info!("load_subtitle: loaded from {}", path);
+        Ok(CommandResult::Empty)
+    }
+
+    fn toggle_subtitle(&self) -> raptor_core::Result<CommandResult> {
+        let engine = self
+            .subtitle_engine
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| raptor_core::RaptorError::Internal("subtitle engine not initialized".into()))?;
+
+        let state = engine.lock().shared_state();
+        let mut state = state.lock();
+        state.enabled = !state.enabled;
+        let enabled = state.enabled;
+        drop(state);
+        self.properties.set("subtitle_enabled", PropertyValue::Bool(enabled));
+        tracing::info!("toggle_subtitle: enabled={}", enabled);
+        Ok(CommandResult::Empty)
+    }
+
+    fn load_danmaku(&self, path: &str) -> raptor_core::Result<CommandResult> {
+        let engine = self
+            .danmaku_engine
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| raptor_core::RaptorError::Internal("danmaku engine not initialized".into()))?;
+
+        engine.lock().load_from_file(path)?;
+        self.properties.set("danmaku_enabled", PropertyValue::Bool(true));
+        tracing::info!("load_danmaku: loaded from {}", path);
+        Ok(CommandResult::Empty)
+    }
+
+    fn toggle_danmaku(&self) -> raptor_core::Result<CommandResult> {
+        let engine = self
+            .danmaku_engine
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| raptor_core::RaptorError::Internal("danmaku engine not initialized".into()))?;
+
+        let state = engine.lock().shared_state();
+        let mut state = state.lock();
+        state.enabled = !state.enabled;
+        let enabled = state.enabled;
+        drop(state);
+        self.properties.set("danmaku_enabled", PropertyValue::Bool(enabled));
+        tracing::info!("toggle_danmaku: enabled={}", enabled);
+        Ok(CommandResult::Empty)
+    }
+
+    /// 获取 HUD 统计信息（供 CLI 播放器输出）
+    pub fn get_hud_stats(&self) -> raptor_render::HudStats {
+        let (position, duration) = self.pipeline.lock().as_ref()
+            .map(|p| (p.current_position_secs(), p.duration_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0))
+            .unwrap_or((0.0, 0.0));
+
+        let paused = self.pipeline.lock().as_ref()
+            .map(|p| p.is_paused())
+            .unwrap_or(true);
+
+        let (subtitle_on, danmaku_on, danmaku_count) = {
+            let sub_on = self.subtitle_engine.lock().as_ref()
+                .map(|e| e.lock().shared_state().lock().enabled)
+                .unwrap_or(false);
+            let (dm_on, dm_count) = self.danmaku_engine.lock().as_ref()
+                .map(|e| {
+                    let state = e.lock().shared_state();
+                    let s = state.lock();
+                    (s.enabled, s.instances.len() as u32)
+                })
+                .unwrap_or((false, 0));
+            (sub_on, dm_on, dm_count)
+        };
+
+        raptor_render::HudStats {
+            paused,
+            position_secs: position,
+            duration_secs: duration,
+            subtitle_on,
+            danmaku_on,
+            danmaku_count,
+            ..Default::default()
+        }
     }
 }
 

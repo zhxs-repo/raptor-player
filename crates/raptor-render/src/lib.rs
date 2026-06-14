@@ -1,3 +1,5 @@
+pub mod overlay;
 pub mod wgpu_renderer;
 
-pub use wgpu_renderer::{VideoOutput, WgpuRenderer};
+pub use overlay::{Overlay, OverlayStack, SharedOverlay};
+pub use wgpu_renderer::{HudStats, VideoOutput, WgpuRenderer};
