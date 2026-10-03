@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# Dart
+dart/**/.dart_tool/
+.dart_tool/

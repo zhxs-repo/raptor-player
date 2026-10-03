@@ -28,8 +28,11 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @group(0) @binding(0) var overlay_tex: texture_2d<f32>;
 @group(0) @binding(1) var overlay_sampler: sampler;
+// .x = \fad/样式 alpha 乘子（0..1），每条字幕一个 uniform 槽位
+@group(0) @binding(2) var<uniform> fade: vec4<f32>;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(overlay_tex, overlay_sampler, in.uv);
+    let c = textureSample(overlay_tex, overlay_sampler, in.uv);
+    return vec4<f32>(c.rgb, c.a * clamp(fade.x, 0.0, 1.0));
 }

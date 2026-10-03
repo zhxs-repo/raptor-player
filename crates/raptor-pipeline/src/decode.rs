@@ -5,6 +5,9 @@ use crossbeam_channel::{Receiver, Sender};
 use raptor_ffmpeg::{AudioDecoder, AudioFrame, Packet, VideoDecoder, VideoFrame};
 
 use crate::pipeline::Pipeline;
+use crate::seek::{recv_current, Stamped};
+
+const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Video decode loop — 从 video_pkt_rx 接收数据包，解码后送入 video_frame_tx
 ///
@@ -15,8 +18,8 @@ const MAX_VIDEO_BUFFER_FRAMES: usize = 8;
 pub fn video_decode_loop(
     pipeline: Arc<Pipeline>,
     mut decoder: Box<dyn VideoDecoder>,
-    video_pkt_rx: Receiver<Packet>,
-    video_frame_tx: Sender<VideoFrame>,
+    video_pkt_rx: Receiver<Stamped<Packet>>,
+    video_frame_tx: Sender<Stamped<VideoFrame>>,
 ) -> raptor_core::Result<()> {
     tracing::info!("video_decode_loop started");
 
@@ -48,12 +51,15 @@ pub fn video_decode_loop(
             tracing::debug!("video decoder flushed (seek_gen={})", seek_gen);
         }
 
-        match video_pkt_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(pkt) => {
-                if pkt.data.is_empty() {
-                    continue; // seek drain marker
+        match recv_current(&video_pkt_rx, seek_gen, RECV_TIMEOUT) {
+            Ok(stamped) => {
+                // 等待期间可能又发生了一次 seek：该包同样属于旧 generation，丢弃
+                let gen_now = pipeline.seek_generation.load(Ordering::Acquire);
+                if stamped.generation != gen_now {
+                    continue;
                 }
-                if let Err(e) = decoder.submit_packet(&pkt) {
+
+                if let Err(e) = decoder.submit_packet(&stamped.item) {
                     tracing::warn!("video decode submit_packet: {}", e);
                     continue;
                 }
@@ -64,7 +70,8 @@ pub fn video_decode_loop(
                             if frame_count.is_multiple_of(50) {
                                 tracing::info!("video_decode: decoded {} frames", frame_count);
                             }
-                            if video_frame_tx.send(frame).is_err() {
+                            let stamped = Stamped::new(gen_now, frame);
+                            if video_frame_tx.send(stamped).is_err() {
                                 tracing::debug!("video_frame_tx closed");
                                 return Ok(());
                             }
@@ -93,8 +100,8 @@ pub fn video_decode_loop(
 pub fn audio_decode_loop(
     pipeline: Arc<Pipeline>,
     mut decoder: Box<dyn AudioDecoder>,
-    audio_pkt_rx: Receiver<Packet>,
-    audio_frame_tx: Sender<AudioFrame>,
+    audio_pkt_rx: Receiver<Stamped<Packet>>,
+    audio_frame_tx: Sender<Stamped<AudioFrame>>,
 ) -> raptor_core::Result<()> {
     tracing::info!("audio_decode_loop started");
 
@@ -119,12 +126,14 @@ pub fn audio_decode_loop(
             tracing::debug!("audio decoder flushed (seek_gen={})", seek_gen);
         }
 
-        match audio_pkt_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(pkt) => {
-                if pkt.data.is_empty() {
+        match recv_current(&audio_pkt_rx, seek_gen, RECV_TIMEOUT) {
+            Ok(stamped) => {
+                let gen_now = pipeline.seek_generation.load(Ordering::Acquire);
+                if stamped.generation != gen_now {
                     continue;
                 }
-                if let Err(e) = decoder.submit_packet(&pkt) {
+
+                if let Err(e) = decoder.submit_packet(&stamped.item) {
                     tracing::warn!("audio decode submit_packet: {}", e);
                     continue;
                 }
@@ -135,7 +144,8 @@ pub fn audio_decode_loop(
                             if frame_count.is_multiple_of(100) {
                                 tracing::info!("audio_decode: decoded {} frames", frame_count);
                             }
-                            if audio_frame_tx.send(frame).is_err() {
+                            let stamped = Stamped::new(gen_now, frame);
+                            if audio_frame_tx.send(stamped).is_err() {
                                 tracing::debug!("audio_frame_tx closed");
                                 return Ok(());
                             }

@@ -69,12 +69,16 @@ impl PropertyStore for DefaultPropertyStore {
     fn set(&self, key: &str, value: PropertyValue) {
         self.store.write().insert(key.to_string(), value.clone());
 
-        // 通知观察者
-        let observers = self.observers.read();
-        if let Some(observer_list) = observers.get(key) {
-            for (_id, callback) in observer_list {
-                callback(&value);
-            }
+        // 先在读锁内克隆回调列表，释放锁后再调用，避免回调重入 observe/unobserve 死锁
+        let callbacks: Vec<PropertyObserver> = {
+            self.observers
+                .read()
+                .get(key)
+                .map(|list| list.iter().map(|(_, cb)| cb.clone()).collect())
+                .unwrap_or_default()
+        };
+        for callback in &callbacks {
+            callback(&value);
         }
     }
 
@@ -198,6 +202,27 @@ mod tests {
     }
 
     #[test]
+    fn test_observer_reentrant_no_deadlock() {
+        let store = Arc::new(make_store());
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let store_c = store.clone();
+        let observed_c = observed.clone();
+        store.observe(
+            "volume",
+            Arc::new(move |_val| {
+                // 回调内重入 observe/unobserve：旧实现持读锁时此处死锁
+                let id = store_c.observe("volume", Arc::new(|_| {}));
+                store_c.unobserve("volume", id);
+                observed_c.store(true, Ordering::Relaxed);
+            }),
+        );
+
+        store.set("volume", PropertyValue::Int(1));
+        assert!(observed.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn test_multiple_observers() {
         let store = make_store();
         let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -214,5 +239,31 @@ mod tests {
 
         store.set("volume", PropertyValue::Int(50));
         assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn test_to_json_string() {
+        assert_eq!(PropertyValue::String("hello".into()).to_json(), "\"hello\"");
+    }
+
+    #[test]
+    fn test_to_json_string_with_quotes() {
+        assert_eq!(PropertyValue::String("a\"b".into()).to_json(), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn test_to_json_int() {
+        assert_eq!(PropertyValue::Int(42).to_json(), "42");
+    }
+
+    #[test]
+    fn test_to_json_float() {
+        assert_eq!(PropertyValue::Float(2.75).to_json(), "2.75");
+    }
+
+    #[test]
+    fn test_to_json_bool() {
+        assert_eq!(PropertyValue::Bool(true).to_json(), "true");
+        assert_eq!(PropertyValue::Bool(false).to_json(), "false");
     }
 }

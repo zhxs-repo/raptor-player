@@ -25,3 +25,6 @@ tracing-subscriber = { workspace = true }
 [[example]]
 name = "cli_player"
 path = "examples/cli_player.rs"
+
+[dev-dependencies]
+wgpu = { workspace = true }

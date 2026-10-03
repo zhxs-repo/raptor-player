@@ -82,6 +82,11 @@ impl AVSync {
         let mut state = self.state.lock();
 
         if state.start_instant.is_none() {
+            // seek/pause-resume 后（reset 将基准置 None）以首帧惰性重锚定，
+            // 之后正常按挂钟推进，避免视频以解码速度狂奔
+            state.start_instant = Some(Instant::now());
+            state.base_pts = frame_pts;
+            state.consecutive_drops = 0;
             return VideoSyncDecision::Display;
         }
 
@@ -208,6 +213,23 @@ mod tests {
         assert_eq!(sync.video_clock(), 0.0);
         // reset 后 start_instant 为 None，master_clock 应为 0
         assert_eq!(sync.master_clock(), 0.0);
+    }
+
+    #[test]
+    fn test_reset_reanchors_and_paces() {
+        let sync = AVSync::new();
+        sync.set_first_frame_time(0.0);
+        sync.reset(5.0);
+        // 首帧重锚定并显示
+        assert!(matches!(
+            sync.video_sync_decision(5.0),
+            VideoSyncDecision::Display
+        ));
+        // 之后的超前帧必须 Wait（回归：旧实现 reset 后无条件 Display）
+        assert!(matches!(
+            sync.video_sync_decision(15.0),
+            VideoSyncDecision::Wait(_)
+        ));
     }
 
     #[test]

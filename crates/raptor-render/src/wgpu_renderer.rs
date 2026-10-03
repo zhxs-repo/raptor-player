@@ -1,13 +1,27 @@
+use crate::clock::OverlayClock;
 use crate::overlay::OverlayStack;
+use crate::yuv_pipeline::{interleave_uv_planes, setup_yuv_pipeline};
 use raptor_core::Result;
 use raptor_ffmpeg::{PixelFormat, VideoFrame};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use winit::event_loop::{EventLoop, EventLoopBuilder};
 use winit::platform::pump_events::EventLoopExtPumpEvents;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::WindowBuilder;
+
+/// 拿不到显示器刷新率时的兜底渲染周期（60Hz）
+const FALLBACK_FRAME_PERIOD: Duration = Duration::from_micros(16_667);
+/// FIFO（vsync）模式下的轮询预算：上屏节拍由 present 阻塞自然对齐刷新率，
+/// 这里只需保证命令与窗口事件的响应性
+const VSYNC_POLL_BUDGET: Duration = Duration::from_millis(4);
+/// pending 帧队列深度：够吸收一次节拍错相，又不引入额外延迟
+const PENDING_FRAME_CAPACITY: usize = 2;
+/// 刷新率探测间隔（窗口可能被拖到另一块显示器上）
+const REFRESH_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// HUD 播放统计 — 用于窗口标题栏显示
 #[derive(Debug, Clone, Default)]
@@ -27,6 +41,35 @@ pub struct HudStats {
     pub danmaku_count: u32,
 }
 
+/// 平台原生 Surface 句柄 — 用于外部 Surface 注入（Android / 嵌入式）
+///
+/// FFI 层将平台原生窗口指针封装为此类型，供 `ExternalRenderer` 创建 wgpu Surface。
+/// 各平台含义：
+/// - Android: `native_window` = `ANativeWindow*`
+/// - 其他平台可扩展（如 WaylandSurface、XlibWindow 等）
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceHandle {
+    /// 平台原生窗口指针（Android: `ANativeWindow*`）
+    pub native_window: u64,
+    /// 平台原生显示连接（Android 不使用，保留为 0）
+    pub native_display: u64,
+    /// Surface 宽度（像素）
+    pub width: u32,
+    /// Surface 高度（像素）
+    pub height: u32,
+}
+
+impl SurfaceHandle {
+    pub fn new(native_window: u64, native_display: u64, width: u32, height: u32) -> Self {
+        Self {
+            native_window,
+            native_display,
+            width,
+            height,
+        }
+    }
+}
+
 /// VideoOutput trait — 视频输出抽象
 pub trait VideoOutput: Send {
     fn init(&mut self, width: u32, height: u32) -> Result<()>;
@@ -42,8 +85,39 @@ pub trait VideoOutput: Send {
         false
     }
     fn poll(&mut self) {}
+    /// 获取渲染线程累计渲染帧总数（用于计算实时 FPS）
+    fn render_frame_count(&self) -> u64 {
+        0
+    }
     /// 更新窗口标题（用于 HUD 信息显示）
     fn set_title(&mut self, _title: &str) {}
+
+    /// 冻结叠加层挂钟（暂停/EOF 时调用）
+    ///
+    /// 渲染线程会在两个视频帧之间按挂钟外推 Overlay 时间，暂停时必须冻结，
+    /// 否则画面静止而弹幕继续滑动。
+    fn freeze_overlay_clock(&self) {}
+
+    /// 设置 Overlay 叠加层（字幕、弹幕等）
+    ///
+    /// 默认实现为 no-op，具体实现在各 Renderer 中。
+    fn set_overlays(&mut self, _overlays: Vec<Box<dyn crate::overlay::Overlay>>) {}
+
+    // === Surface 生命周期（Android / 嵌入式平台） ===
+
+    /// 分离当前 Surface（Surface 被销毁时调用，如 Android onPause）
+    ///
+    /// 渲染线程将暂停上屏，但保持解码状态不变。
+    fn detach_surface(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 重新附加 Surface（Surface 重建时调用，如 Android onResume）
+    ///
+    /// 渲染线程使用新的 SurfaceHandle 重建 wgpu Surface 并恢复上屏。
+    fn reattach_surface(&mut self, _handle: SurfaceHandle) -> Result<()> {
+        Ok(())
+    }
 }
 
 enum WindowCmd {
@@ -69,10 +143,24 @@ struct WindowRenderer {
     bind_group: wgpu::BindGroup,
     window_size: (u32, u32),
     last_frame: Option<VideoFrame>,
+    /// 已收到但尚未到上屏节拍的视频帧（按序，每节拍取一帧）
+    pending_frames: VecDeque<VideoFrame>,
     window_should_close: bool,
     title: String,
     /// 共享标志：窗口关闭时设置为 true，供 WgpuRenderer 侧读取
     window_closed_flag: Arc<AtomicBool>,
+    /// 累计渲染帧数（供 WgpuRenderer 侧读取计算 FPS）
+    render_frame_count: Arc<AtomicU64>,
+    /// 叠加层挂钟时钟：pipeline 线程锚定，窗口线程每个节拍读取
+    overlay_clock: Arc<OverlayClock>,
+    /// 上一次 present 使用的媒体时间（秒），用于跳过无变化的重绘
+    last_pts: f64,
+    /// 目标渲染周期（仅在无 vsync 阻塞的软件节流路径下生效）
+    frame_period: Duration,
+    /// present 是否由 vsync 阻塞（FIFO 下上屏速率由显示器决定）
+    vsync_locked: bool,
+    /// 上次探测显示器刷新率的时刻
+    refresh_probe_at: Instant,
     /// Overlay 合成栈（字幕、弹幕等叠加层）
     overlay_stack: OverlayStack,
 }
@@ -83,6 +171,8 @@ impl WindowRenderer {
         width: u32,
         height: u32,
         closed_flag: Arc<AtomicBool>,
+        frame_counter: Arc<AtomicU64>,
+        overlay_clock: Arc<OverlayClock>,
     ) -> std::result::Result<Self, String> {
         let mut builder = EventLoopBuilder::new();
         #[cfg(target_os = "windows")]
@@ -121,16 +211,14 @@ impl WindowRenderer {
         }))
         .map_err(|_| "no suitable GPU adapter".to_string())?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("raptor_device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: Default::default(),
-                memory_hints: Default::default(),
-                trace: Default::default(),
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("raptor_device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: Default::default(),
+            memory_hints: Default::default(),
+            trace: Default::default(),
+        }))
         .map_err(|e| format!("device: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
@@ -140,11 +228,12 @@ impl WindowRenderer {
             .copied()
             .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
 
-        // 优先使用 Mailbox（无 vsync 阻塞、低延迟），不可用时回退到 FIFO
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else {
+        // 优先 FIFO：把上屏节拍交给显示器（vsync 阻塞），叠加层动画与刷新率对齐且无撕裂。
+        // 极少数不支持 FIFO 的后端回退 Mailbox，由本线程按刷新率做软件节流。
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
             wgpu::PresentMode::Fifo
+        } else {
+            wgpu::PresentMode::Mailbox
         };
 
         let surface_config = wgpu::SurfaceConfiguration {
@@ -155,18 +244,25 @@ impl WindowRenderer {
             present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
-            desired_maximum_frame_latency: 1,
+            // 2 个在飞帧：FIFO 下仍然锁在 vblank，但允许下一帧的上传/绘制与
+            // 当前帧的扫描输出重叠，避免单帧偶发抖动直接掉到半刷新率
+            desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 
         let (render_pipeline, bind_group, y_texture, uv_texture) =
-            Self::setup_pipeline(&device, surface_format, width, height);
+            setup_yuv_pipeline(&device, surface_format, width, height, "");
+
+        let frame_period = Self::probe_frame_period(&window);
+        let vsync_locked = present_mode == wgpu::PresentMode::Fifo;
 
         tracing::info!(
-            "WindowRenderer initialized: {}x{}, format={:?}",
+            "WindowRenderer initialized: {}x{}, format={:?}, present={:?}, target {:.1}fps",
             width,
             height,
-            surface_format
+            surface_format,
+            present_mode,
+            1.0 / frame_period.as_secs_f64()
         );
 
         Ok(Self {
@@ -184,36 +280,67 @@ impl WindowRenderer {
             bind_group,
             window_size,
             last_frame: None,
+            pending_frames: VecDeque::with_capacity(PENDING_FRAME_CAPACITY),
             window_should_close: false,
             title: "Raptor Player".to_string(),
             window_closed_flag: closed_flag,
+            render_frame_count: frame_counter,
+            overlay_clock,
+            last_pts: 0.0,
+            frame_period,
+            vsync_locked,
+            refresh_probe_at: Instant::now(),
             overlay_stack: OverlayStack::new(),
         })
+    }
+
+    /// 目标渲染周期：跟随当前显示器的刷新率，读不到时按 60Hz 兜底
+    fn probe_frame_period(window: &winit::window::Window) -> Duration {
+        window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|mhz| *mhz > 0)
+            .map(|mhz| Duration::from_secs_f64(1000.0 / mhz as f64))
+            .unwrap_or(FALLBACK_FRAME_PERIOD)
     }
 
     fn pump_events(&mut self) {
         let mut should_close = false;
         let mut new_size: Option<(u32, u32)> = None;
-        let _ =
-            self.event_loop
-                .pump_events(Some(std::time::Duration::from_millis(5)), |event, _| {
-                    if let winit::event::Event::WindowEvent { event, .. } = event {
-                        match event {
-                            winit::event::WindowEvent::CloseRequested => {
-                                should_close = true;
-                            }
-                            winit::event::WindowEvent::Resized(size) => {
-                                new_size = Some((size.width.max(1), size.height.max(1)));
-                            }
-                            _ => {}
+        // 非阻塞取事件：节拍由 run() 的 recv_timeout 提供，这里绝不等待，
+        // 否则每个渲染周期都要白等数毫秒，把上屏速率压到刷新率以下
+        let _ = self
+            .event_loop
+            .pump_events(Some(Duration::ZERO), |event, _| {
+                if let winit::event::Event::WindowEvent { event, .. } = event {
+                    match event {
+                        winit::event::WindowEvent::CloseRequested => {
+                            should_close = true;
                         }
+                        winit::event::WindowEvent::Resized(size) => {
+                            new_size = Some((size.width.max(1), size.height.max(1)));
+                        }
+                        _ => {}
                     }
-                });
+                }
+            });
         if should_close {
             self.window_should_close = true;
         }
         if self.title != "Raptor Player" {
             self.window.set_title(&self.title);
+        }
+        // 窗口可能被拖到另一块显示器上：定期重新对齐刷新率
+        if self.refresh_probe_at.elapsed() >= REFRESH_PROBE_INTERVAL {
+            self.refresh_probe_at = Instant::now();
+            let period = Self::probe_frame_period(&self.window);
+            if period != self.frame_period {
+                tracing::info!(
+                    "WindowRenderer: refresh target changed to {:.1}fps",
+                    1.0 / period.as_secs_f64()
+                );
+                self.frame_period = period;
+            }
         }
         if let Some(size) = new_size {
             self.window_size = size;
@@ -226,26 +353,18 @@ impl WindowRenderer {
         }
     }
 
-    fn render_frame(&mut self, frame: &VideoFrame) {
-        self.pump_events();
-        if self.window_should_close {
-            return;
-        }
-        self.last_frame = Some(frame.clone());
-        self.render_frame_inner(frame);
-    }
-
     /// 实际渲染逻辑：上传纹理 + 计算 viewport + 绘制
     fn render_frame_inner(&mut self, frame: &VideoFrame) {
         // 视频分辨率变化 → 重建纹理（不影响 surface 尺寸）
         if frame.width != self.width || frame.height != self.height {
             self.width = frame.width;
             self.height = frame.height;
-            let (pipeline, bg, yt, uvt) = Self::setup_pipeline(
+            let (pipeline, bg, yt, uvt) = setup_yuv_pipeline(
                 &self.device,
                 self.surface_config.format,
                 frame.width,
                 frame.height,
+                "",
             );
             self.render_pipeline = pipeline;
             self.bind_group = bg;
@@ -340,7 +459,16 @@ impl WindowRenderer {
             }
         }
 
-        // 获取 surface 纹理
+        // 叠加层时间以挂钟为准，在两个视频帧之间也连续推进；
+        // 无时间戳的帧沿用上一次 present 的时间，避免把叠加层时钟重置为 0
+        let overlay_pts = frame.pts_secs().unwrap_or(self.last_pts);
+        self.present_frame(self.overlay_clock.now_pts().max(overlay_pts));
+    }
+
+    /// 视频 pass + overlay pass + present（不上传视频纹理，由 render_frame_inner 或节拍空档调用）
+    ///
+    /// `pts` 为本次上屏的叠加层媒体时间（秒）。
+    fn present_frame(&mut self, pts: f64) {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -404,8 +532,7 @@ impl WindowRenderer {
         }
         // 渲染所有 Overlay 叠加层（字幕、弹幕等）
         // 在 video pass 之后、present 之前执行
-        let current_pts = frame.pts;
-        self.overlay_stack.update_all(current_pts);
+        self.overlay_stack.update_all(pts);
         if !self.overlay_stack.is_empty() {
             self.overlay_stack.render_all(
                 &self.device,
@@ -420,150 +547,38 @@ impl WindowRenderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+        self.last_pts = pts;
+        self.render_frame_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn setup_pipeline(
-        device: &wgpu::Device,
-        surface_format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> (
-        wgpu::RenderPipeline,
-        wgpu::BindGroup,
-        wgpu::Texture,
-        wgpu::Texture,
-    ) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("yuv_to_rgb"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader/yuv_to_rgb.wgsl").into()),
-        });
+    /// 收下 pipeline 提交的视频帧，等下一个节拍再上屏
+    fn enqueue_frame(&mut self, frame: VideoFrame) {
+        // 队列满说明一个节拍内到了多帧（片源帧率高于刷新率或相位错开）：
+        // 丢最旧的一帧，保证上屏顺序单调推进
+        if self.pending_frames.len() == PENDING_FRAME_CAPACITY {
+            self.pending_frames.pop_front();
+        }
+        self.pending_frames.push_back(frame);
+    }
 
-        let y_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("y_texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let uv_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("uv_texture"),
-            size: wgpu::Extent3d {
-                width: (width / 2).max(1),
-                height: (height / 2).max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("yuv_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("yuv_bind_group_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("yuv_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&uv_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("yuv_pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("yuv_render_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        (render_pipeline, bind_group, y_texture, uv_texture)
+    /// 一个渲染节拍：有新视频帧就上传上屏，否则只在叠加层时间推进时重绘
+    fn render_tick(&mut self) {
+        if let Some(frame) = self.pending_frames.pop_front() {
+            self.last_frame = Some(frame.clone());
+            self.render_frame_inner(&frame);
+            return;
+        }
+        // 叠加层不推进（无叠加层/暂停/帧流停滞）时不重复 present，省下空转的 GPU 与 CPU
+        if self.last_frame.is_none()
+            || self.overlay_stack.is_empty()
+            || !self.overlay_clock.is_live()
+        {
+            return;
+        }
+        let pts = self.overlay_clock.now_pts();
+        if pts != self.last_pts {
+            self.present_frame(pts);
+        }
     }
 
     fn run(
@@ -573,38 +588,66 @@ impl WindowRenderer {
         closed_flag: Arc<AtomicBool>,
     ) {
         let _ = ready_tx.send(());
+        let mut next_tick = Instant::now();
         loop {
-            match cmd_rx.recv_timeout(std::time::Duration::from_millis(16)) {
-                Ok(WindowCmd::Frame(frame)) => {
-                    self.render_frame(&frame);
-                    if self.window_should_close {
-                        closed_flag.store(true, Ordering::Release);
-                        break;
+            // FIFO 下 present 自身阻塞到下一个 vblank，节拍由显示器决定；
+            // 无 vsync 的后端按探测到的刷新率做软件节流
+            let wait = if self.vsync_locked {
+                VSYNC_POLL_BUDGET
+            } else {
+                next_tick.saturating_duration_since(Instant::now())
+            };
+            match cmd_rx.recv_timeout(wait) {
+                Ok(cmd) => match cmd {
+                    WindowCmd::Frame(frame) => self.enqueue_frame(frame),
+                    WindowCmd::SetOverlays(overlays) => {
+                        self.overlay_stack = OverlayStack::new();
+                        for overlay in overlays {
+                            self.overlay_stack.push(overlay);
+                        }
+                        tracing::info!(
+                            "WindowRenderer: overlay stack updated ({} overlays)",
+                            self.overlay_stack.len()
+                        );
+                        // 叠加层内容变了但挂钟可能没推进（如暂停中加载弹幕）：立即重绘一次
+                        if self.last_frame.is_some() {
+                            let pts = self.overlay_clock.now_pts().max(self.last_pts);
+                            self.present_frame(pts);
+                        }
                     }
-                }
-                Ok(WindowCmd::SetOverlays(overlays)) => {
-                    self.overlay_stack = OverlayStack::new();
-                    for overlay in overlays {
-                        self.overlay_stack.push(overlay);
+                    WindowCmd::SetTitle(title) => {
+                        self.title = title.clone();
+                        self.window.set_title(&title);
                     }
-                    tracing::info!(
-                        "WindowRenderer: overlay stack updated ({} overlays)",
-                        self.overlay_stack.len()
-                    );
-                }
-                Ok(WindowCmd::SetTitle(title)) => {
-                    self.title = title.clone();
-                    self.window.set_title(&title);
-                }
-                Ok(WindowCmd::Shutdown) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.pump_events();
-                    if self.window_should_close {
-                        closed_flag.store(true, Ordering::Release);
-                        break;
-                    }
-                }
+                    WindowCmd::Shutdown => break,
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            // 命令在节拍到期前到达时不占用本节拍，但 pending 已满时必须让出一次上屏，
+            // 否则片源帧率高于刷新率会把渲染饿死
+            if !self.vsync_locked
+                && Instant::now() < next_tick
+                && self.pending_frames.len() < PENDING_FRAME_CAPACITY
+            {
+                continue;
+            }
+
+            self.pump_events();
+            if self.window_should_close {
+                closed_flag.store(true, Ordering::Release);
+                break;
+            }
+            self.render_tick();
+
+            if !self.vsync_locked {
+                next_tick += self.frame_period;
+                let now = Instant::now();
+                if next_tick < now {
+                    // 落后超过一个节拍（渲染耗时超出预算）：重新对齐，不追帧空转
+                    next_tick = now;
+                }
             }
         }
         tracing::info!("window thread exiting");
@@ -620,6 +663,10 @@ pub struct WgpuRenderer {
     cmd_tx: Option<mpsc::SyncSender<WindowCmd>>,
     /// 共享标志：窗口线程在窗口关闭时设置为 true，外部通过 should_stop() 读取
     window_closed: Arc<AtomicBool>,
+    /// 窗口线程累计渲染帧数（用于计算实时 FPS）
+    render_frame_count: Arc<AtomicU64>,
+    /// 叠加层挂钟时钟：本线程按上屏帧锚定，窗口线程按挂钟外推
+    overlay_clock: Arc<OverlayClock>,
     initialized: bool,
 }
 
@@ -632,6 +679,8 @@ impl WgpuRenderer {
             height: 0,
             cmd_tx: None,
             window_closed: Arc::new(AtomicBool::new(false)),
+            render_frame_count: Arc::new(AtomicU64::new(0)),
+            overlay_clock: Arc::new(OverlayClock::new()),
             initialized: false,
         }
     }
@@ -642,7 +691,14 @@ impl WgpuRenderer {
     /// 在 pipeline 启动后调用，确保窗口线程已就绪。
     pub fn set_overlays(&self, overlays: Vec<Box<dyn crate::overlay::Overlay>>) {
         if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(WindowCmd::SetOverlays(overlays));
+            if let Err(e) = tx.try_send(WindowCmd::SetOverlays(overlays)) {
+                tracing::error!(
+                    "set_overlays FAILED: {:?} (channel full or disconnected)",
+                    e
+                );
+            }
+        } else {
+            tracing::warn!("set_overlays: renderer not initialized, overlays dropped");
         }
     }
 }
@@ -661,10 +717,13 @@ impl VideoOutput for WgpuRenderer {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<WindowCmd>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let closed_flag = Arc::clone(&self.window_closed);
+        let frame_counter = Arc::clone(&self.render_frame_count);
+        let overlay_clock = Arc::clone(&self.overlay_clock);
         std::thread::Builder::new()
             .name("raptor-window".into())
-            .spawn(
-                move || match WindowRenderer::new(width, height, closed_flag) {
+            .spawn(move || {
+                match WindowRenderer::new(width, height, closed_flag, frame_counter, overlay_clock)
+                {
                     Ok(wr) => {
                         let flag = Arc::clone(&wr.window_closed_flag);
                         wr.run(cmd_rx, ready_tx, flag);
@@ -672,8 +731,8 @@ impl VideoOutput for WgpuRenderer {
                     Err(e) => {
                         tracing::error!("WindowRenderer init failed: {e}");
                     }
-                },
-            )
+                }
+            })
             .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn window thread: {e}")))?;
         ready_rx.recv().map_err(|_| {
             raptor_core::RaptorError::Internal("window thread failed to start".into())
@@ -687,6 +746,10 @@ impl VideoOutput for WgpuRenderer {
     fn submit_frame(&mut self, frame: &VideoFrame) -> raptor_core::Result<()> {
         if !self.initialized || self.window_closed.load(Ordering::Acquire) {
             return Ok(());
+        }
+        // 以本帧 PTS 重新锚定叠加层挂钟，窗口线程据此外推（无时间戳帧不覆盖）
+        if let Some(secs) = frame.pts_secs() {
+            self.overlay_clock.reanchor(secs);
         }
         if let Some(tx) = &self.cmd_tx {
             // 使用 try_send 避免无界队列内存增长；
@@ -718,14 +781,35 @@ impl VideoOutput for WgpuRenderer {
     ///
     /// 旧实现会向窗口线程发送零尺寸空帧来触发事件泵，但窗口线程收到空帧后
     /// 仍会执行完整的 render pass（清屏黑色 → present），导致画面/黑屏交替闪烁。
-    /// 窗口线程的 recv_timeout(16ms) 已保证每 16ms 泵一次事件，无需外部触发。
+    /// 窗口线程按刷新率节拍自行泵事件，无需外部触发。
     fn poll(&mut self) {
         // 无操作 — 窗口线程自行泵事件
+    }
+
+    fn freeze_overlay_clock(&self) {
+        self.overlay_clock.freeze();
+    }
+
+    fn render_frame_count(&self) -> u64 {
+        self.render_frame_count.load(Ordering::Relaxed)
     }
 
     fn set_title(&mut self, title: &str) {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.try_send(WindowCmd::SetTitle(title.to_string()));
+        }
+    }
+
+    fn set_overlays(&mut self, overlays: Vec<Box<dyn crate::overlay::Overlay>>) {
+        if let Some(tx) = &self.cmd_tx {
+            if let Err(e) = tx.try_send(WindowCmd::SetOverlays(overlays)) {
+                tracing::error!(
+                    "VideoOutput::set_overlays FAILED: {:?} (channel full or disconnected)",
+                    e
+                );
+            }
+        } else {
+            tracing::warn!("VideoOutput::set_overlays: not initialized, overlays dropped");
         }
     }
 }
@@ -739,49 +823,9 @@ impl Drop for WgpuRenderer {
     }
 }
 
-fn interleave_uv_planes(
-    u_data: &[u8],
-    u_stride: usize,
-    v_data: &[u8],
-    v_stride: usize,
-    uv_width: usize,
-    uv_height: usize,
-) -> Vec<u8> {
-    let mut result = Vec::with_capacity(uv_width * uv_height * 2);
-    for row in 0..uv_height {
-        for col in 0..uv_width {
-            let u = if row * u_stride + col < u_data.len() {
-                u_data[row * u_stride + col]
-            } else {
-                128
-            };
-            let v = if row * v_stride + col < v_data.len() {
-                v_data[row * v_stride + col]
-            } else {
-                128
-            };
-            result.push(u);
-            result.push(v);
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn test_interleave_uv_planes() {
-        let u = vec![10u8, 20, 30, 40];
-        let v = vec![50u8, 60, 70, 80];
-        let result = interleave_uv_planes(&u, 2, &v, 2, 2, 2);
-        assert_eq!(result, vec![10, 50, 20, 60, 30, 70, 40, 80]);
-    }
-    #[test]
-    fn test_interleave_uv_empty() {
-        let result = interleave_uv_planes(&[], 0, &[], 0, 0, 0);
-        assert!(result.is_empty());
-    }
     #[test]
     fn test_renderer_new() {
         let renderer = WgpuRenderer::new();

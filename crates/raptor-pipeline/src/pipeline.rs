@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Sender};
 use parking_lot::Mutex;
-use raptor_audio::{AudioOutput, CpalOutput};
+use raptor_audio::{create_default_output, AudioOutput};
 use raptor_core::{AudioInfo, RaptorEvent, VideoInfo};
 use raptor_ffmpeg::{AudioDecoder, Demuxer, FfmpegAudioDecoder, FfmpegVideoDecoder, VideoDecoder};
 use raptor_render::VideoOutput;
@@ -13,7 +13,8 @@ use raptor_subtitle::SubtitleEngine;
 use crate::avsync::AVSync;
 use crate::decode::{audio_decode_loop, video_decode_loop};
 use crate::demux::demux_loop;
-use crate::output::{audio_output_loop, render_loop};
+use crate::output::{audio_output_loop, render_loop, RendererCmd};
+use crate::seek::Stamped;
 use crate::subtitle::subtitle_decode_loop;
 
 /// Seek 请求
@@ -40,7 +41,9 @@ pub struct Pipeline {
     pub paused: Arc<AtomicBool>,
     pub volume: Arc<AtomicU32>,
     pub event_tx: Sender<RaptorEvent>,
-    thread_handles: Vec<std::thread::JoinHandle<()>>,
+    /// 渲染器命令发送端（FFI 层 → render_loop，用于 Surface 管理）
+    pub renderer_cmd_tx: Option<crossbeam_channel::Sender<RendererCmd>>,
+    thread_handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl Pipeline {
@@ -56,13 +59,19 @@ impl Pipeline {
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(100)),
             event_tx,
-            thread_handles: Vec::new(),
+            renderer_cmd_tx: None,
+            thread_handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// 获取当前播放位置（秒）
     pub fn current_position_secs(&self) -> f64 {
         self.position_us.load(Ordering::Acquire) as f64 / 1_000_000.0
+    }
+
+    /// 获取总时长（秒）
+    pub fn duration_secs(&self) -> f64 {
+        self.duration_us.load(Ordering::Acquire) as f64 / 1_000_000.0
     }
 
     /// 暂停 pipeline
@@ -98,15 +107,17 @@ impl Pipeline {
     ///
     /// 接受已打开的 demuxer，避免重复打开文件。
     /// `subtitle_engine` 用于内嵌字幕流的解码和渲染。
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
         url: &str,
         mut demuxer: Box<dyn Demuxer>,
-        renderer: Box<dyn VideoOutput>,
+        renderer: Arc<Mutex<Box<dyn VideoOutput>>>,
         duration_secs: f64,
         video_info: Option<VideoInfo>,
         audio_info: Option<AudioInfo>,
         subtitle_engine: Option<Arc<Mutex<SubtitleEngine>>>,
+        renderer_cmd_rx: Option<crossbeam_channel::Receiver<RendererCmd>>,
     ) -> raptor_core::Result<()> {
         tracing::info!(
             "Pipeline::start: url={}, duration={:.2}s",
@@ -137,19 +148,23 @@ impl Pipeline {
         let has_subtitle = info.subtitle_stream_index.is_some() && subtitle_engine.is_some();
 
         // 创建 channels
-        let (video_pkt_tx, video_pkt_rx) = bounded::<raptor_ffmpeg::Packet>(512);
-        let (audio_pkt_tx, audio_pkt_rx) = bounded::<raptor_ffmpeg::Packet>(1024);
-        let (video_frame_tx, video_frame_rx) = bounded::<raptor_ffmpeg::VideoFrame>(32);
-        let (audio_frame_tx, audio_frame_rx) = bounded::<raptor_ffmpeg::AudioFrame>(64);
+        // 载荷带 seek generation：seek 后在途的旧 generation 数据由消费端直接丢弃，
+        // 无需排空通道也无法把旧位置的画面/声音播出来
+        let (video_pkt_tx, video_pkt_rx) = bounded::<Stamped<raptor_ffmpeg::Packet>>(512);
+        let (audio_pkt_tx, audio_pkt_rx) = bounded::<Stamped<raptor_ffmpeg::Packet>>(1024);
+        let (video_frame_tx, video_frame_rx) = bounded::<Stamped<raptor_ffmpeg::VideoFrame>>(32);
+        let (audio_frame_tx, audio_frame_rx) = bounded::<Stamped<raptor_ffmpeg::AudioFrame>>(64);
 
         // 字幕 packet channel（仅在有内嵌字幕时创建）
         let (subtitle_pkt_tx, subtitle_pkt_rx) = if has_subtitle {
-            let (tx, rx) = bounded::<raptor_ffmpeg::Packet>(256);
+            let (tx, rx) = bounded::<Stamped<raptor_ffmpeg::Packet>>(256);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
 
+        // 构建线程共享的 Pipeline 引用
+        // thread_handles 通过 Arc<Mutex<Vec>> 共享，stop() 可从 &self 调用
         let pipeline = Arc::new(Pipeline {
             avsync: self.avsync.clone(),
             seek_request: self.seek_request.clone(),
@@ -161,7 +176,8 @@ impl Pipeline {
             paused: self.paused.clone(),
             volume: self.volume.clone(),
             event_tx: self.event_tx.clone(),
-            thread_handles: Vec::new(),
+            renderer_cmd_tx: None, // 工作线程不需要，仅 FFI 层使用
+            thread_handles: self.thread_handles.clone(),
         });
 
         // 1. Demux 线程
@@ -175,7 +191,7 @@ impl Pipeline {
                 .unwrap_or_else(|e| tracing::error!("demux thread error: {}", e));
             })
             .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn demux: {e}")))?;
-        self.thread_handles.push(h);
+        self.thread_handles.lock().push(h);
 
         // 2. Video decode 线程
         if has_video {
@@ -194,7 +210,7 @@ impl Pipeline {
                     .unwrap_or_else(|e| tracing::error!("video decode thread error: {}", e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn vdecode: {e}")))?;
-            self.thread_handles.push(h);
+            self.thread_handles.lock().push(h);
         }
 
         // 3. Audio decode 线程
@@ -214,12 +230,13 @@ impl Pipeline {
                     .unwrap_or_else(|e| tracing::error!("audio decode thread error: {}", e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn adecode: {e}")))?;
-            self.thread_handles.push(h);
+            self.thread_handles.lock().push(h);
         }
 
         // 4. Render 线程
         {
             let p = pipeline.clone();
+            let renderer = renderer.clone();
             let event_tx = self.event_tx.clone();
             let vi = video_info.clone();
             let ai = audio_info.clone();
@@ -236,18 +253,19 @@ impl Pipeline {
                             has_video,
                             vi,
                             ai,
+                            renderer_cmd_rx,
                         )
                     })
                     .unwrap_or_else(|e| tracing::error!("render thread error: {}", e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn render: {e}")))?;
-            self.thread_handles.push(h);
+            self.thread_handles.lock().push(h);
         }
 
         // 5. Audio output 线程
         {
             tracing::info!("Pipeline::start: creating audio output...");
-            let mut audio_output: Box<dyn AudioOutput> = Box::new(CpalOutput::new());
+            let mut audio_output: Box<dyn AudioOutput> = create_default_output();
             if let Some(ref ai) = audio_info {
                 audio_output.init(ai.sample_rate, ai.channels)?;
             } else if info.sample_rate > 0 {
@@ -263,13 +281,13 @@ impl Pipeline {
                         .unwrap_or_else(|e| tracing::error!("audio thread error: {}", e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn audio: {e}")))?;
-            self.thread_handles.push(h);
+            self.thread_handles.lock().push(h);
             tracing::info!("Pipeline::start: audio thread spawned");
         }
 
         // 6. Subtitle decode 线程（仅在有内嵌字幕时启动）
         if let (Some(subtitle_pkt_rx), Some(sub_engine)) = (subtitle_pkt_rx, subtitle_engine) {
-            let is_text_subtitle = info.subtitle_codec_id.map_or(false, |id| {
+            let is_text_subtitle = info.subtitle_codec_id.is_some_and(|id| {
                 matches!(
                     id,
                     raptor_ffmpeg::SubtitleCodecId::MovText
@@ -287,24 +305,34 @@ impl Pipeline {
                     .unwrap_or_else(|e| tracing::error!("subtitle thread error: {}", e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn subtitle: {e}")))?;
-            self.thread_handles.push(h);
+            self.thread_handles.lock().push(h);
             tracing::info!("Pipeline::start: subtitle thread spawned");
         }
 
-        tracing::info!("Pipeline started: {} threads", self.thread_handles.len());
+        tracing::info!(
+            "Pipeline started: {} threads",
+            self.thread_handles.lock().len()
+        );
         Ok(())
     }
 
-    /// 停止 pipeline — 等待所有线程退出
-    pub fn stop(&mut self) {
-        tracing::info!(
-            "Pipeline::stop (thread_handles.len={})",
-            self.thread_handles.len()
-        );
+    /// 仅置位 shutdown 标志，不 join 线程
+    ///
+    /// 供 FFI 层使用：position reporter 等后台线程依赖 shutdown 退出，必须在
+    /// join 它们之前发出信号，否则 join 会永久阻塞（stop() 内部才置位就太晚了）。
+    pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+    }
 
-        // 取出 thread handles
-        let handles: Vec<_> = self.thread_handles.drain(..).collect();
+    /// 停止 pipeline — 设置 shutdown 标志并等待所有线程退出
+    ///
+    /// 可通过 `&self` 调用，因为 thread_handles 通过 `Arc<Mutex<Vec>>` 共享。
+    pub fn stop(&self) {
+        tracing::info!("Pipeline::stop");
+        self.request_shutdown();
+
+        // 取出 thread handles 并逐一 join
+        let handles: Vec<_> = self.thread_handles.lock().drain(..).collect();
         for handle in handles {
             let _ = handle.join();
         }
@@ -339,6 +367,118 @@ impl Pipeline {
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
+        // stop() 已经是 &self 方法，直接调用
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pipeline() -> Pipeline {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        Pipeline::new(tx)
+    }
+
+    #[test]
+    fn test_new_pipeline_defaults() {
+        let p = make_pipeline();
+        assert!((p.current_position_secs() - 0.0).abs() < f64::EPSILON);
+        assert!((p.duration_secs() - 0.0).abs() < f64::EPSILON);
+        assert!(!p.is_paused());
+        assert_eq!(p.get_volume(), 100);
+    }
+
+    #[test]
+    fn test_pause_resume() {
+        let p = make_pipeline();
+        assert!(!p.is_paused());
+
+        p.pause();
+        assert!(p.is_paused());
+
+        p.resume();
+        assert!(!p.is_paused());
+    }
+
+    #[test]
+    fn test_set_volume() {
+        let p = make_pipeline();
+        p.set_volume(50);
+        assert_eq!(p.get_volume(), 50);
+
+        p.set_volume(0);
+        assert_eq!(p.get_volume(), 0);
+
+        p.set_volume(100);
+        assert_eq!(p.get_volume(), 100);
+    }
+
+    #[test]
+    fn test_position_tracking() {
+        let p = make_pipeline();
+        // 模拟位置更新 (5秒 = 5_000_000 微秒)
+        p.position_us.store(5_000_000, Ordering::Release);
+        assert!((p.current_position_secs() - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_duration_tracking() {
+        let p = make_pipeline();
+        // 模拟时长 (120秒 = 120_000_000 微秒)
+        p.duration_us.store(120_000_000, Ordering::Release);
+        assert!((p.duration_secs() - 120.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_seek_request() {
+        let p = make_pipeline();
+        assert!(p.seek_request.lock().is_none());
+
+        *p.seek_request.lock() = Some(SeekRequest {
+            target: 30.0,
+            from: 10.0,
+        });
+        let req = p.seek_request.lock().take();
+        assert!(req.is_some());
+        assert!((req.unwrap().target - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_seek_generation() {
+        let p = make_pipeline();
+        assert_eq!(p.seek_generation.load(Ordering::Acquire), 0);
+
+        p.seek_generation.fetch_add(1, Ordering::Release);
+        assert_eq!(p.seek_generation.load(Ordering::Acquire), 1);
+
+        p.seek_generation.fetch_add(1, Ordering::Release);
+        assert_eq!(p.seek_generation.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn test_shutdown_flag() {
+        let p = make_pipeline();
+        assert!(!p.shutdown.load(Ordering::Acquire));
+
+        p.shutdown.store(true, Ordering::Release);
+        assert!(p.shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_stop_with_no_threads() {
+        // 没有线程的 pipeline 调用 stop 不应 panic
+        let p = make_pipeline();
+        p.stop();
+    }
+
+    #[test]
+    fn test_resume_resets_avsync() {
+        let p = make_pipeline();
+        p.position_us.store(10_000_000, Ordering::Release); // 10s
+        p.resume(); // 应重置 avsync 到当前位置
+                    // resume 后 is_paused 应为 false
+        assert!(!p.is_paused());
     }
 }

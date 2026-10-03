@@ -15,8 +15,6 @@ pub enum RaptorEvent {
     Error { code: i32, message: String },
     /// Seek 完成
     Seek { from: f64, to: f64 },
-    /// 属性变更
-    PropertyChange { name: String, value: String },
     /// 播放重启（resume 后触发）
     PlaybackRestart,
     /// 播放器终止

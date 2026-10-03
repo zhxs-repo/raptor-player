@@ -5,6 +5,6 @@ pub mod types;
 pub use decoder::{AudioDecoder, FfmpegAudioDecoder, FfmpegVideoDecoder, VideoDecoder};
 pub use demuxer::{Demuxer, FfmpegDemuxer};
 pub use types::{
-    AudioCodecId, AudioFrame, MediaInfo, Packet, PixelFormat, PlaneData, SampleFormat,
-    SubtitleCodecId, VideoCodecId, VideoFrame,
+    seconds_to_ticks, ticks_to_seconds, time_base, AudioCodecId, AudioFrame, MediaInfo, Packet,
+    PixelFormat, PlaneData, SampleFormat, SubtitleCodecId, VideoCodecId, VideoFrame,
 };

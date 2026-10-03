@@ -26,14 +26,18 @@ pub trait AudioOutput: Send {
 ///
 /// 使用共享 `VecDeque<f32>` 作为 ring buffer，
 /// audio_output_loop 写入，cpal 回调读取。
+/// ring buffer 有固定上限，超出时丢弃最老的采样，防止 OOM。
 pub struct CpalOutput {
     stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<VecDeque<f32>>>,
     volume: Arc<std::sync::atomic::AtomicU32>, // 用 atomic bits 存 f32
-    sample_rate: u32,      // 源采样率（FFmpeg 输出）
-    device_rate: u32,      // 设备采样率（cpal 实际播放）
+    sample_rate: u32,                          // 源采样率（FFmpeg 输出）
+    device_rate: u32,                          // 设备采样率（cpal 实际播放）
     channels: u32,
 }
+
+/// Ring buffer 容量上限：约 1 秒的立体声 48kHz 采样
+const MAX_BUFFER_SAMPLES: usize = 48000 * 2;
 
 // SAFETY: CpalOutput is only used from a dedicated audio thread.
 // The cpal::Stream is not accessed concurrently.
@@ -160,7 +164,11 @@ impl AudioOutput for CpalOutput {
                 let frac = (src_pos - src_idx as f64) as f32;
 
                 for ch in 0..channels {
-                    let s0 = frame.samples.get(src_idx * channels + ch).copied().unwrap_or(0.0);
+                    let s0 = frame
+                        .samples
+                        .get(src_idx * channels + ch)
+                        .copied()
+                        .unwrap_or(0.0);
                     let s1 = frame
                         .samples
                         .get((src_idx + 1) * channels + ch)
@@ -170,6 +178,12 @@ impl AudioOutput for CpalOutput {
                 }
             }
         }
+
+        // Ring buffer 上限保护：超出时丢弃最老的采样，防止 OOM
+        while buf.len() > MAX_BUFFER_SAMPLES {
+            buf.pop_front();
+        }
+
         Ok(())
     }
 

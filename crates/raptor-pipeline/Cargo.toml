@@ -14,3 +14,6 @@ raptor-danmaku = { path = "../raptor-danmaku" }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+ffmpeg-next = { workspace = true }

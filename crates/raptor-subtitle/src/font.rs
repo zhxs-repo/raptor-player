@@ -18,7 +18,10 @@ pub fn load_system_font() -> Option<Vec<u8>> {
             return Some(data);
         }
     }
-    tracing::warn!("font: no system font found among {} candidates", candidates.len());
+    tracing::warn!(
+        "font: no system font found among {} candidates",
+        candidates.len()
+    );
     None
 }
 
@@ -30,12 +33,12 @@ fn font_candidates() -> Vec<String> {
             .map(|w| format!("{w}\\Fonts"))
             .unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
         vec![
-            format!("{fonts_dir}\\msyh.ttc"),       // 微软雅黑
-            format!("{fonts_dir}\\msyhbd.ttc"),      // 微软雅黑 Bold
-            format!("{fonts_dir}\\segoeui.ttf"),     // Segoe UI
-            format!("{fonts_dir}\\arial.ttf"),       // Arial
-            format!("{fonts_dir}\\simsun.ttc"),      // 宋体
-            format!("{fonts_dir}\\simhei.ttf"),      // 黑体
+            format!("{fonts_dir}\\msyh.ttc"),    // 微软雅黑
+            format!("{fonts_dir}\\msyhbd.ttc"),  // 微软雅黑 Bold
+            format!("{fonts_dir}\\segoeui.ttf"), // Segoe UI
+            format!("{fonts_dir}\\arial.ttf"),   // Arial
+            format!("{fonts_dir}\\simsun.ttc"),  // 宋体
+            format!("{fonts_dir}\\simhei.ttf"),  // 黑体
         ]
     }
 

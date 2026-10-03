@@ -146,11 +146,11 @@ fn main() {
                                 Some(UserCmd::LoadDanmaku(parts[1].trim().to_string()))
                             }
                             "b" => Some(UserCmd::ToggleDanmaku),
-                            "o" if parts.len() > 1 => {
-                                parts[1].trim().parse::<u8>().ok().map(|v| {
-                                    UserCmd::SetDanmakuOpacity(v.min(100))
-                                })
-                            }
+                            "o" if parts.len() > 1 => parts[1]
+                                .trim()
+                                .parse::<u8>()
+                                .ok()
+                                .map(|v| UserCmd::SetDanmakuOpacity(v.min(100))),
                             "p" => Some(UserCmd::TogglePause),
                             "q" => Some(UserCmd::Quit),
                             _ => {
@@ -184,7 +184,9 @@ fn main() {
             let status = if stats.paused { "PAUSE" } else { "PLAY " };
             println!(
                 "[HUD] {} | {:.1}/{:.0}s | 字幕:{} | 弹幕:{} ({}条)",
-                status, stats.position_secs, stats.duration_secs,
+                status,
+                stats.position_secs,
+                stats.duration_secs,
                 if stats.subtitle_on { "ON" } else { "OFF" },
                 if stats.danmaku_on { "ON" } else { "OFF" },
                 stats.danmaku_count,
@@ -201,12 +203,10 @@ fn main() {
                         Err(e) => eprintln!("  Error: {}", e),
                     }
                 }
-                UserCmd::ToggleSubtitle => {
-                    match player.dispatch_command(Command::ToggleSubtitle) {
-                        Ok(_) => println!("  Subtitle toggled"),
-                        Err(e) => eprintln!("  Error: {}", e),
-                    }
-                }
+                UserCmd::ToggleSubtitle => match player.dispatch_command(Command::ToggleSubtitle) {
+                    Ok(_) => println!("  Subtitle toggled"),
+                    Err(e) => eprintln!("  Error: {}", e),
+                },
                 UserCmd::LoadDanmaku(path) => {
                     println!("  Loading danmaku: {}", path);
                     match player.dispatch_command(Command::LoadDanmaku { path }) {
@@ -214,12 +214,10 @@ fn main() {
                         Err(e) => eprintln!("  Error: {}", e),
                     }
                 }
-                UserCmd::ToggleDanmaku => {
-                    match player.dispatch_command(Command::ToggleDanmaku) {
-                        Ok(_) => println!("  Danmaku toggled"),
-                        Err(e) => eprintln!("  Error: {}", e),
-                    }
-                }
+                UserCmd::ToggleDanmaku => match player.dispatch_command(Command::ToggleDanmaku) {
+                    Ok(_) => println!("  Danmaku toggled"),
+                    Err(e) => eprintln!("  Error: {}", e),
+                },
                 UserCmd::SetDanmakuOpacity(val) => {
                     match player.dispatch_command(Command::SetDanmakuOpacity { opacity: val }) {
                         Ok(_) => println!("  Danmaku opacity → {}", val),

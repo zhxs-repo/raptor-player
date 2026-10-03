@@ -6,12 +6,15 @@
 //! - ab_glyph + wgpu 文本渲染
 //! - 实现 raptor_render::Overlay trait
 
+pub mod dfm_core;
+pub mod glyph_atlas;
 pub mod layout;
 pub mod parser;
 pub mod renderer;
 pub mod types;
 
-pub use layout::LayoutEngine;
+pub use glyph_atlas::{GlyphAtlas, GlyphAtlasSnapshot, GlyphInstance, RenderPlan, TextRasterizer};
+pub use layout::{FrameItem, FrameLayout, LayoutEngine, PreparedItem, PreparedLayout};
 pub use parser::{BilibiliXmlParser, DanmakuParser, JsonParser};
 pub use renderer::{DanmakuEngine, DanmakuState};
 pub use types::{DanmakuConfig, DanmakuInstance, DanmakuItem, DanmakuMode};

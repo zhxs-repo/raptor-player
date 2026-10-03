@@ -30,7 +30,7 @@ pub trait AudioDecoder: Send {
 pub struct FfmpegVideoDecoder {
     decoder: Option<ffmpeg_next::decoder::Video>,
     pixel_format: PixelFormat,
-    /// Packet time base — 用于将 Packet.pts(秒) 转换回 AVPacket 的 tick 单位
+    /// Packet/Frame 时间基 — 视频解码帧 PTS 直接沿用输入 Packet 的时间基
     pkt_timebase: ffmpeg_next::Rational,
 }
 
@@ -39,7 +39,7 @@ impl FfmpegVideoDecoder {
         Self {
             decoder: None,
             pixel_format: PixelFormat::Unknown,
-            pkt_timebase: ffmpeg_next::Rational::new(1, 90000),
+            pkt_timebase: ffmpeg_next::Rational::new(0, 1),
         }
     }
 
@@ -50,19 +50,14 @@ impl FfmpegVideoDecoder {
             .video()
             .map_err(|e| RaptorError::Decode(format!("video decoder open: {e}")))?;
         let pf = PixelFormat::from(video.format());
-        let pkt_tb = video.packet_time_base();
-        let pkt_timebase = if pkt_tb.numerator() > 0 && pkt_tb.denominator() > 0 {
-            pkt_tb
-        } else {
-            ffmpeg_next::Rational::new(1, 90000)
-        };
+        // avctx.pkt_timebase 打开时通常为 0/1（未设置），实际时间基由首个 Packet 携带
+        let pkt_timebase = video.packet_time_base();
         tracing::info!(
-            "FfmpegVideoDecoder from_stream_context: {}x{} {:?}, pkt_timebase={}/{}",
+            "FfmpegVideoDecoder from_stream_context: {}x{} {:?}, pkt_timebase={}",
             video.width(),
             video.height(),
             pf,
-            pkt_timebase.numerator(),
-            pkt_timebase.denominator()
+            pkt_timebase
         );
         Ok(Self {
             decoder: Some(video),
@@ -84,10 +79,12 @@ impl VideoDecoder for FfmpegVideoDecoder {
             .decoder
             .as_mut()
             .ok_or_else(|| RaptorError::InvalidState("video decoder not configured".into()))?;
-        // 将 Packet.pts(秒) 转换回 AVPacket tick 单位
-        let pts_ticks = seconds_to_av_time(packet.pts, self.pkt_timebase);
-        let dts_ticks = seconds_to_av_time(packet.dts, self.pkt_timebase);
-        let borrow = BorrowWithPts::new(&packet.data, pts_ticks, dts_ticks);
+        // Packet 携带原始 tick + 时间基，直接同步给解码器，不做秒↔tick 往返
+        if needs_timebase_update(self.pkt_timebase, packet.time_base) {
+            decoder.set_packet_time_base(packet.time_base);
+            self.pkt_timebase = packet.time_base;
+        }
+        let borrow = BorrowWithPts::new(&packet.data, packet.pts, packet.dts);
         decoder
             .send_packet(&borrow)
             .map_err(|e| RaptorError::Decode(format!("send_packet: {e}")))?;
@@ -118,13 +115,13 @@ impl VideoDecoder for FfmpegVideoDecoder {
                     planes.push(PlaneData { data, stride });
                 }
 
-                let pts = frame
-                    .pts()
-                    .map(|p| av_time_to_seconds(p, self.pkt_timebase))
-                    .unwrap_or(0.0);
+                // 视频解码帧 PTS 是输入 Packet PTS 的透传，时间基同为 pkt_timebase；
+                // 无时间戳（NOPTS）时保持 None，不伪装成 0
+                let pts = frame.pts();
 
                 Ok(Some(VideoFrame {
                     pts,
+                    time_base: self.pkt_timebase,
                     width,
                     height,
                     format: self.pixel_format,
@@ -149,7 +146,7 @@ pub struct FfmpegAudioDecoder {
     sample_format: SampleFormat,
     sample_rate: u32,
     channels: u32,
-    /// Packet time base — 用于将 Packet.pts(秒) 转换回 AVPacket 的 tick 单位
+    /// Packet 时间基 — 由首个有效 Packet.time_base 同步到 avctx.pkt_timebase
     pkt_timebase: ffmpeg_next::Rational,
 }
 
@@ -160,7 +157,7 @@ impl FfmpegAudioDecoder {
             sample_format: SampleFormat::Unknown,
             sample_rate: 0,
             channels: 0,
-            pkt_timebase: ffmpeg_next::Rational::new(1, 90000),
+            pkt_timebase: ffmpeg_next::Rational::new(0, 1),
         }
     }
 
@@ -173,17 +170,13 @@ impl FfmpegAudioDecoder {
         let rate = audio.rate();
         let ch = audio.channels() as u32;
         let sf = SampleFormat::from(audio.format());
-        let pkt_tb = audio.packet_time_base();
-        let pkt_timebase = if pkt_tb.numerator() > 0 && pkt_tb.denominator() > 0 {
-            pkt_tb
-        } else {
-            ffmpeg_next::Rational::new(1, 90000)
-        };
+        let pkt_timebase = audio.packet_time_base();
         tracing::info!(
-            "FfmpegAudioDecoder from_stream_context: {}Hz {}ch {:?}",
+            "FfmpegAudioDecoder from_stream_context: {}Hz {}ch {:?}, pkt_timebase={}",
             rate,
             ch,
-            sf
+            sf,
+            pkt_timebase
         );
         Ok(Self {
             decoder: Some(audio),
@@ -192,6 +185,15 @@ impl FfmpegAudioDecoder {
             channels: ch,
             pkt_timebase,
         })
+    }
+
+    /// 解码音频帧的时间基：FFmpeg 音频解码器以采样为单位输出 PTS
+    fn frame_timebase(&self) -> ffmpeg_next::Rational {
+        if self.sample_rate > 0 {
+            ffmpeg_next::Rational::new(1, self.sample_rate as i32)
+        } else {
+            self.pkt_timebase
+        }
     }
 }
 
@@ -207,9 +209,12 @@ impl AudioDecoder for FfmpegAudioDecoder {
             .decoder
             .as_mut()
             .ok_or_else(|| RaptorError::InvalidState("audio decoder not configured".into()))?;
-        let pts_ticks = seconds_to_av_time(packet.pts, self.pkt_timebase);
-        let dts_ticks = seconds_to_av_time(packet.dts, self.pkt_timebase);
-        let borrow = BorrowWithPts::new(&packet.data, pts_ticks, dts_ticks);
+        // 解码器需要正确的 pkt_timebase 才能把 Packet PTS 换算成采样单位的帧 PTS
+        if needs_timebase_update(self.pkt_timebase, packet.time_base) {
+            decoder.set_packet_time_base(packet.time_base);
+            self.pkt_timebase = packet.time_base;
+        }
+        let borrow = BorrowWithPts::new(&packet.data, packet.pts, packet.dts);
         decoder
             .send_packet(&borrow)
             .map_err(|e| RaptorError::Decode(format!("send_packet: {e}")))?;
@@ -224,13 +229,13 @@ impl AudioDecoder for FfmpegAudioDecoder {
         let mut frame = ffmpeg_next::frame::Audio::empty();
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
-                let pts = frame
-                    .pts()
-                    .map(|p| av_time_to_seconds(p, self.pkt_timebase))
-                    .unwrap_or(0.0);
+                // 帧 PTS 单位是 1/sample_rate（不是 Packet 时间基），无时间戳保持 None
+                let pts = frame.pts();
+                let time_base = self.frame_timebase();
                 let samples = extract_audio_samples(&frame);
                 Ok(Some(AudioFrame {
                     pts,
+                    time_base,
                     sample_rate: self.sample_rate,
                     channels: self.channels,
                     format: self.sample_format,
@@ -249,12 +254,12 @@ impl AudioDecoder for FfmpegAudioDecoder {
     }
 }
 
-/// 秒 → AVPacket tick 单位转换
-fn seconds_to_av_time(secs: f64, time_base: ffmpeg_next::Rational) -> Option<i64> {
-    if time_base.numerator() == 0 || time_base.denominator() == 0 {
-        return None;
-    }
-    Some((secs * time_base.denominator() as f64 / time_base.numerator() as f64) as i64)
+/// Packet 时间基有效且与解码器已记录值不同 → 需要同步到 avctx.pkt_timebase
+fn needs_timebase_update(current: ffmpeg_next::Rational, incoming: ffmpeg_next::Rational) -> bool {
+    incoming.numerator() != 0
+        && incoming.denominator() != 0
+        && (current.numerator() != incoming.numerator()
+            || current.denominator() != incoming.denominator())
 }
 
 /// BorrowWithPts — 类似 ffmpeg_next::packet::Borrow，但在 AVPacket 中设置 PTS/DTS
@@ -308,11 +313,12 @@ fn is_eagain(err: &ffmpeg_next::Error) -> bool {
 /// 从 FFmpeg 音频帧提取 f32 采样
 ///
 /// 处理 planar（每声道独立 buffer）和 packed（声道交错在 data(0)）两种布局。
+/// 支持 F32/I16/I32/U8/F64 格式，统一归一化到 [-1.0, 1.0] f32 范围。
 fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
     let channels = frame.channels() as usize;
     let samples = frame.samples();
-
     let format = frame.format();
+
     let is_planar = matches!(
         format,
         ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar)
@@ -329,37 +335,156 @@ fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
         for s in 0..samples {
             for c in 0..channels {
                 let data = frame.data(c);
-                if data.len() >= (s + 1) * 4 {
-                    let offset = s * 4;
-                    let sample = f32::from_ne_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]);
-                    output.push(sample);
-                } else {
-                    output.push(0.0);
-                }
+                let sample = match format {
+                    ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar) => {
+                        let offset = s * 4;
+                        if offset + 4 <= data.len() {
+                            f32::from_ne_bytes([
+                                data[offset],
+                                data[offset + 1],
+                                data[offset + 2],
+                                data[offset + 3],
+                            ])
+                        } else {
+                            0.0
+                        }
+                    }
+                    ffmpeg_next::format::Sample::F64(ffmpeg_next::format::sample::Type::Planar) => {
+                        let offset = s * 8;
+                        if offset + 8 <= data.len() {
+                            f64::from_ne_bytes([
+                                data[offset],
+                                data[offset + 1],
+                                data[offset + 2],
+                                data[offset + 3],
+                                data[offset + 4],
+                                data[offset + 5],
+                                data[offset + 6],
+                                data[offset + 7],
+                            ]) as f32
+                        } else {
+                            0.0
+                        }
+                    }
+                    ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Planar) => {
+                        let offset = s * 2;
+                        if offset + 2 <= data.len() {
+                            i16::from_ne_bytes([data[offset], data[offset + 1]]) as f32
+                                / i16::MAX as f32
+                        } else {
+                            0.0
+                        }
+                    }
+                    ffmpeg_next::format::Sample::I32(ffmpeg_next::format::sample::Type::Planar) => {
+                        let offset = s * 4;
+                        if offset + 4 <= data.len() {
+                            i32::from_ne_bytes([
+                                data[offset],
+                                data[offset + 1],
+                                data[offset + 2],
+                                data[offset + 3],
+                            ]) as f32
+                                / i32::MAX as f32
+                        } else {
+                            0.0
+                        }
+                    }
+                    ffmpeg_next::format::Sample::U8(ffmpeg_next::format::sample::Type::Planar)
+                        if s < data.len() =>
+                    {
+                        (data[s] as f32 - 128.0) / 128.0
+                    }
+                    _ => 0.0,
+                };
+                output.push(sample);
             }
         }
     } else {
         // Packed: 所有声道交错存储在 data(0)
         let data = frame.data(0);
-        let bytes_per_sample = 4; // f32 = 4 bytes
         let total = samples * channels;
-        for i in 0..total {
-            let offset = i * bytes_per_sample;
-            if offset + bytes_per_sample <= data.len() {
-                let sample = f32::from_ne_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]);
-                output.push(sample);
-            } else {
-                output.push(0.0);
+        match format {
+            ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed) => {
+                for i in 0..total {
+                    let offset = i * 4;
+                    if offset + 4 <= data.len() {
+                        output.push(f32::from_ne_bytes([
+                            data[offset],
+                            data[offset + 1],
+                            data[offset + 2],
+                            data[offset + 3],
+                        ]));
+                    } else {
+                        output.push(0.0);
+                    }
+                }
+            }
+            ffmpeg_next::format::Sample::F64(ffmpeg_next::format::sample::Type::Packed) => {
+                for i in 0..total {
+                    let offset = i * 8;
+                    if offset + 8 <= data.len() {
+                        output.push(f64::from_ne_bytes([
+                            data[offset],
+                            data[offset + 1],
+                            data[offset + 2],
+                            data[offset + 3],
+                            data[offset + 4],
+                            data[offset + 5],
+                            data[offset + 6],
+                            data[offset + 7],
+                        ]) as f32);
+                    } else {
+                        output.push(0.0);
+                    }
+                }
+            }
+            ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed) => {
+                for i in 0..total {
+                    let offset = i * 2;
+                    if offset + 2 <= data.len() {
+                        output.push(
+                            i16::from_ne_bytes([data[offset], data[offset + 1]]) as f32
+                                / i16::MAX as f32,
+                        );
+                    } else {
+                        output.push(0.0);
+                    }
+                }
+            }
+            ffmpeg_next::format::Sample::I32(ffmpeg_next::format::sample::Type::Packed) => {
+                for i in 0..total {
+                    let offset = i * 4;
+                    if offset + 4 <= data.len() {
+                        output.push(
+                            i32::from_ne_bytes([
+                                data[offset],
+                                data[offset + 1],
+                                data[offset + 2],
+                                data[offset + 3],
+                            ]) as f32
+                                / i32::MAX as f32,
+                        );
+                    } else {
+                        output.push(0.0);
+                    }
+                }
+            }
+            ffmpeg_next::format::Sample::U8(ffmpeg_next::format::sample::Type::Packed) => {
+                for i in 0..total {
+                    if i < data.len() {
+                        output.push((data[i] as f32 - 128.0) / 128.0);
+                    } else {
+                        output.push(0.0);
+                    }
+                }
+            }
+            _ => {
+                // 未知格式：输出零采样，避免噪声
+                tracing::warn!(
+                    "extract_audio_samples: unsupported packed format {:?}",
+                    format
+                );
+                output.resize(total, 0.0);
             }
         }
     }
@@ -390,8 +515,9 @@ mod tests {
         let pkt = Packet {
             data: vec![],
             stream_index: 0,
-            pts: 0.0,
-            dts: 0.0,
+            pts: None,
+            dts: None,
+            time_base: ffmpeg_next::Rational::new(1, 90000),
             is_key: false,
         };
         let result = d.submit_packet(&pkt);
@@ -414,5 +540,35 @@ mod tests {
     fn test_audio_decoder_flush_no_panic() {
         let mut d = FfmpegAudioDecoder::new();
         d.flush();
+    }
+
+    #[test]
+    fn test_needs_timebase_update() {
+        let tb = ffmpeg_next::Rational::new(1, 15360);
+        // 未设置（0/1）→ 需要更新
+        assert!(needs_timebase_update(ffmpeg_next::Rational::new(0, 1), tb));
+        // 相同 → 不更新
+        assert!(!needs_timebase_update(tb, tb));
+        // 无效时间基 → 不更新（不得用 0/1 覆盖已有正确基）
+        assert!(!needs_timebase_update(tb, ffmpeg_next::Rational::new(0, 1)));
+        assert!(!needs_timebase_update(tb, ffmpeg_next::Rational::new(5, 0)));
+    }
+
+    /// 回归：NOPTS Packet 进入 AVPacket 时必须是 AV_NOPTS_VALUE，而不是 0
+    #[test]
+    fn test_borrow_with_pts_keeps_nopts() {
+        use ffmpeg_next::ffi::AV_NOPTS_VALUE;
+        let data = vec![1u8, 2, 3];
+
+        let borrow = BorrowWithPts::new(&data, None, None);
+        let raw = unsafe { &*borrow.as_ptr() };
+        assert_eq!(raw.pts, AV_NOPTS_VALUE);
+        assert_eq!(raw.dts, AV_NOPTS_VALUE);
+
+        // 真实 0 时间戳必须原样保留，与 NOPTS 区分
+        let zero = BorrowWithPts::new(&data, Some(0), Some(0));
+        let zero_raw = unsafe { &*zero.as_ptr() };
+        assert_eq!(zero_raw.pts, 0);
+        assert_eq!(zero_raw.dts, 0);
     }
 }

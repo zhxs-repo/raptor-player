@@ -74,3 +74,63 @@ impl RaptorError {
 
 /// Raptor Result 类型
 pub type Result<T> = std::result::Result<T, RaptorError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_code_mapping() {
+        assert_eq!(
+            RaptorError::InvalidArgument("x".into()).error_code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            RaptorError::InvalidState("x".into()).error_code(),
+            ErrorCode::InvalidState
+        );
+        assert_eq!(
+            RaptorError::FileNotFound("x".into()).error_code(),
+            ErrorCode::FileNotFound
+        );
+        assert_eq!(
+            RaptorError::Demux("x".into()).error_code(),
+            ErrorCode::DemuxError
+        );
+        assert_eq!(
+            RaptorError::Decode("x".into()).error_code(),
+            ErrorCode::DecodeError
+        );
+        assert_eq!(
+            RaptorError::Render("x".into()).error_code(),
+            ErrorCode::RenderError
+        );
+        assert_eq!(
+            RaptorError::Audio("x".into()).error_code(),
+            ErrorCode::AudioError
+        );
+        assert_eq!(
+            RaptorError::Pipeline("x".into()).error_code(),
+            ErrorCode::PipelineError
+        );
+        assert_eq!(
+            RaptorError::Internal("x".into()).error_code(),
+            ErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn error_code_is_negative() {
+        assert!(ErrorCode::Ok as i32 == 0);
+        assert!((ErrorCode::InvalidArgument as i32) < 0);
+        assert!((ErrorCode::InvalidState as i32) < 0);
+        assert!((ErrorCode::FileNotFound as i32) < 0);
+        assert!((ErrorCode::Internal as i32) < 0);
+    }
+
+    #[test]
+    fn error_display() {
+        let e = RaptorError::FileNotFound("test.mp4".into());
+        assert!(format!("{}", e).contains("test.mp4"));
+    }
+}

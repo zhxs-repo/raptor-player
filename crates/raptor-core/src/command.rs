@@ -32,3 +32,83 @@ pub enum Command {
     /// 退出
     Quit,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_play() {
+        let json = serde_json::to_string(&Command::Play).unwrap();
+        assert_eq!(json, "\"Play\"");
+    }
+
+    #[test]
+    fn deserialize_play() {
+        let cmd: Command = serde_json::from_str("\"Play\"").unwrap();
+        assert!(matches!(cmd, Command::Play));
+    }
+
+    #[test]
+    fn roundtrip_loadfile() {
+        let cmd = Command::LoadFile {
+            url: "/path/to/test.mp4".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let cmd2: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(cmd2, Command::LoadFile { url } if url == "/path/to/test.mp4"));
+    }
+
+    #[test]
+    fn roundtrip_seek() {
+        let cmd = Command::Seek {
+            target: 42.5,
+            mode: SeekMode::Absolute,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let cmd2: Command = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(cmd2, Command::Seek { target, .. } if (target - 42.5).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn roundtrip_set_volume() {
+        let cmd = Command::SetVolume { volume: 75 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let cmd2: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(cmd2, Command::SetVolume { volume } if volume == 75));
+    }
+
+    #[test]
+    fn roundtrip_all_commands() {
+        let commands = vec![
+            Command::Play,
+            Command::Pause,
+            Command::TogglePause,
+            Command::Stop,
+            Command::Quit,
+            Command::LoadFile {
+                url: "test.mp4".into(),
+            },
+            Command::Seek {
+                target: 10.0,
+                mode: SeekMode::Absolute,
+            },
+            Command::SetVolume { volume: 50 },
+            Command::LoadSubtitle {
+                path: "sub.ass".into(),
+            },
+            Command::ToggleSubtitle,
+            Command::LoadDanmaku {
+                path: "dm.xml".into(),
+            },
+            Command::ToggleDanmaku,
+            Command::SetDanmakuOpacity { opacity: 80 },
+        ];
+        for cmd in commands {
+            let json = serde_json::to_string(&cmd).unwrap();
+            let _: Command = serde_json::from_str(&json).unwrap();
+        }
+    }
+}

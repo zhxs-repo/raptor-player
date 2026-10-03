@@ -212,17 +212,20 @@ impl Demuxer for FfmpegDemuxer {
         match av_packet.read(input) {
             Ok(()) => {
                 let stream_idx = av_packet.stream();
+                // 流的 time_base 未知（0/x）时保留无效基，让换算返回 None 而非伪造秒数
                 let time_base = self
                     .time_bases
                     .get(stream_idx)
                     .copied()
-                    .unwrap_or(ffmpeg_next::Rational::new(1, 90000));
+                    .unwrap_or_else(|| ffmpeg_next::Rational::new(0, 1));
 
+                // 保留原始 tick 与 NOPTS 语义：无时间戳的包不得伪装成 ts=0
                 let pkt = Packet {
                     data: av_packet.data().unwrap_or_default().to_vec(),
                     stream_index: stream_idx,
-                    pts: av_time_to_seconds(av_packet.pts().unwrap_or(0), time_base),
-                    dts: av_time_to_seconds(av_packet.dts().unwrap_or(0), time_base),
+                    pts: av_packet.pts(),
+                    dts: av_packet.dts(),
+                    time_base,
                     is_key: av_packet.is_key(),
                 };
                 Ok(Some(pkt))

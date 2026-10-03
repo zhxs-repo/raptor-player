@@ -19,6 +19,7 @@ pub trait Overlay: Send {
     ///
     /// 实现者应该使用 alpha blending 绘制到 target 上。
     /// `surface_width`/`surface_height` 是 surface 的实际尺寸（像素）。
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         device: &wgpu::Device,
@@ -73,6 +74,7 @@ impl OverlayStack {
     }
 
     /// 渲染所有可见的叠加层
+    #[allow(clippy::too_many_arguments)]
     pub fn render_all(
         &mut self,
         device: &wgpu::Device,

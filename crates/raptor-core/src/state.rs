@@ -327,4 +327,60 @@ mod tests {
             Some(PlayerState::Playing)
         );
     }
+
+    // === 额外非法转换测试 ===
+
+    #[test]
+    fn idle_cannot_seek() {
+        assert!(PlayerState::Idle
+            .can_transition_to(&PlayerEvent::Seek {
+                target: 5.0,
+                mode: SeekMode::Absolute
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn stopped_cannot_play() {
+        assert!(PlayerState::Stopped
+            .can_transition_to(&PlayerEvent::Play)
+            .is_err());
+    }
+
+    #[test]
+    fn stopped_cannot_seek() {
+        assert!(PlayerState::Stopped
+            .can_transition_to(&PlayerEvent::Seek {
+                target: 5.0,
+                mode: SeekMode::Absolute
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn ready_cannot_pause() {
+        assert!(PlayerState::Ready
+            .can_transition_to(&PlayerEvent::Pause)
+            .is_err());
+    }
+
+    #[test]
+    fn ready_cannot_seek() {
+        assert!(PlayerState::Ready
+            .can_transition_to(&PlayerEvent::Seek {
+                target: 5.0,
+                mode: SeekMode::Absolute
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn loading_cannot_seek() {
+        assert!(PlayerState::Loading
+            .can_transition_to(&PlayerEvent::Seek {
+                target: 5.0,
+                mode: SeekMode::Absolute
+            })
+            .is_err());
+    }
 }

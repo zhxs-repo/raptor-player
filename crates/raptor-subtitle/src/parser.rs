@@ -1,5 +1,8 @@
 //! 字幕解析器 — 支持 SRT 和 ASS/SSA 格式
 
+use crate::ass::{
+    parse_ass_colour, split_override_segments, Alignment, AssDocument, AssEvent, AssStyle,
+};
 use crate::types::{parse_ass_time, parse_srt_time, strip_ass_tags, SubtitleEvent};
 
 /// 字幕解析器 trait
@@ -85,13 +88,176 @@ impl SubtitleParser for SrtParser {
 
 /// ASS/SSA 字幕解析器
 ///
-/// 解析 [Events] 部分中的 Dialogue 行：
-/// `Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
+/// 完整解析 [Script Info]（PlayResX/Y）、[V4+ Styles]（样式表）与
+/// [Events]（Dialogue 行，含覆盖标签）；见 `AssParser::parse_document`。
 pub struct AssParser;
+
+#[derive(PartialEq)]
+enum Section {
+    None,
+    ScriptInfo,
+    Styles,
+    Events,
+}
+
+fn default_style_fields() -> Vec<String> {
+    "Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,\
+     Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,\
+     Shadow,Alignment,MarginL,MarginR,MarginV,Encoding"
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .collect()
+}
+
+fn default_event_fields() -> Vec<String> {
+    "Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .collect()
+}
+
+fn parse_field_list(rest: &str) -> Vec<String> {
+    rest.split(',').map(|s| s.trim().to_lowercase()).collect()
+}
+
+fn parse_style_line(rest: &str, format: &[String]) -> Option<AssStyle> {
+    let fields: Vec<&str> = rest.splitn(format.len().max(1), ',').collect();
+    let get = |name: &str| {
+        format
+            .iter()
+            .position(|f| f == name)
+            .and_then(|i| fields.get(i).map(|s| s.trim()))
+    };
+
+    let alignment = get("alignment")
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(Alignment)
+        .filter(|a| a.is_valid())
+        .unwrap_or_else(Alignment::default_bottom_center);
+
+    Some(AssStyle {
+        name: get("name")?.to_string(),
+        font_name: get("fontname").unwrap_or("").to_string(),
+        font_size: get("fontsize").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        primary_colour: get("primarycolour")
+            .and_then(parse_ass_colour)
+            .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+        alignment,
+        margin_l: get("marginl").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        margin_r: get("marginr").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        margin_v: get("marginv").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+    })
+}
+
+fn parse_dialogue(rest: &str, format: &[String]) -> Option<AssEvent> {
+    let fields: Vec<&str> = rest.splitn(10.max(format.len()), ',').collect();
+    let get = |name: &str, fallback: usize| -> &str {
+        let i = format.iter().position(|f| f == name).unwrap_or(fallback);
+        fields.get(i).copied().unwrap_or("").trim()
+    };
+
+    let start = parse_ass_time(get("start", 1))?;
+    let end = parse_ass_time(get("end", 2))?;
+    let style = get("style", 3).to_string();
+    let raw_text = get("text", 9);
+    let plain = strip_ass_tags(raw_text).replace("\\N", "\n");
+    if plain.trim().is_empty() {
+        return None;
+    }
+
+    Some(AssEvent {
+        base: SubtitleEvent {
+            start_time: start,
+            end_time: end,
+            text: plain,
+            style,
+        },
+        segments: split_override_segments(raw_text),
+        layer: get("layer", 0).parse().unwrap_or(0),
+        margin_l: get("marginl", 5).parse().unwrap_or(0.0),
+        margin_r: get("marginr", 6).parse().unwrap_or(0.0),
+        margin_v: get("marginv", 7).parse().unwrap_or(0.0),
+    })
+}
 
 impl AssParser {
     pub fn new() -> Self {
         Self
+    }
+
+    /// 解析完整 ASS 文档：画布分辨率、样式表、事件（含覆盖标签段）
+    pub fn parse_document(&self, data: &[u8]) -> AssDocument {
+        let text = match std::str::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => return AssDocument::default(),
+        };
+
+        let mut doc = AssDocument::default();
+        let mut section = Section::None;
+        let mut style_format = default_style_fields();
+        let mut event_format = default_event_fields();
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with(';') {
+                continue;
+            }
+
+            if trimmed.starts_with('[') {
+                let lower = trimmed.to_lowercase();
+                section = if lower == "[script info]" {
+                    Section::ScriptInfo
+                } else if lower.starts_with("[v4") && lower.contains("styles") {
+                    Section::Styles
+                } else if lower == "[events]" {
+                    Section::Events
+                } else {
+                    Section::None
+                };
+                continue;
+            }
+
+            match section {
+                Section::ScriptInfo => {
+                    if let Some((key, value)) = trimmed.split_once(':') {
+                        let value = value.trim();
+                        match key.trim().to_lowercase().as_str() {
+                            "playresx" => doc.play_res_x = value.parse().unwrap_or(0.0),
+                            "playresy" => doc.play_res_y = value.parse().unwrap_or(0.0),
+                            _ => {}
+                        }
+                    }
+                }
+                Section::Styles => {
+                    if let Some(rest) = trimmed.strip_prefix("Format:") {
+                        style_format = parse_field_list(rest);
+                    } else if let Some(rest) = trimmed.strip_prefix("Style:") {
+                        if let Some(style) = parse_style_line(rest, &style_format) {
+                            doc.styles.insert(style.name.clone(), style);
+                        }
+                    }
+                }
+                Section::Events => {
+                    if let Some(rest) = trimmed.strip_prefix("Format:") {
+                        event_format = parse_field_list(rest);
+                    } else if let Some(rest) = trimmed.strip_prefix("Dialogue:") {
+                        if let Some(event) = parse_dialogue(rest, &event_format) {
+                            doc.events.push(event);
+                        }
+                    }
+                }
+                Section::None => {}
+            }
+        }
+
+        tracing::info!(
+            "ASS parser: {} events, {} styles, play_res={:.0}x{:.0}",
+            doc.events.len(),
+            doc.styles.len(),
+            doc.play_res_x,
+            doc.play_res_y
+        );
+        doc
     }
 }
 
@@ -102,85 +268,13 @@ impl Default for AssParser {
 }
 
 impl SubtitleParser for AssParser {
+    /// 向后兼容入口：只返回去标签的纯文本事件
     fn parse(&self, data: &[u8]) -> Vec<SubtitleEvent> {
-        let text = match std::str::from_utf8(data) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut events = Vec::new();
-        let mut in_events = false;
-        let mut format_fields: Vec<String> = Vec::new();
-
-        for line in text.lines() {
-            let trimmed = line.trim();
-
-            // 检测 [Events] 段
-            if trimmed.eq_ignore_ascii_case("[events]") {
-                in_events = true;
-                continue;
-            }
-
-            // 检测其他段（退出 Events 段）
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                in_events = false;
-                continue;
-            }
-
-            if !in_events {
-                continue;
-            }
-
-            // 解析 Format 行
-            if trimmed.starts_with("Format:") {
-                format_fields = trimmed[7..]
-                    .split(',')
-                    .map(|s| s.trim().to_lowercase())
-                    .collect();
-                continue;
-            }
-
-            // 解析 Dialogue 行
-            if trimmed.starts_with("Dialogue:") {
-                let data = &trimmed[9..];
-                let fields: Vec<&str> = data.splitn(10, ',').collect(); // ASS 有 10 个字段
-
-                if fields.len() < 10 {
-                    continue;
-                }
-
-                // 查找 Start, End, Style, Text 的索引
-                let start_idx = format_fields.iter().position(|f| f == "start").unwrap_or(1);
-                let end_idx = format_fields.iter().position(|f| f == "end").unwrap_or(2);
-                let style_idx = format_fields.iter().position(|f| f == "style").unwrap_or(3);
-                let text_idx = format_fields.iter().position(|f| f == "text").unwrap_or(9);
-
-                let start = match parse_ass_time(fields[start_idx].trim()) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let end = match parse_ass_time(fields[end_idx].trim()) {
-                    Some(t) => t,
-                    None => continue,
-                };
-
-                let style = fields[style_idx].trim().to_string();
-                let raw_text = fields[text_idx].trim();
-                let text = strip_ass_tags(raw_text);
-
-                if !text.is_empty() {
-                    events.push(SubtitleEvent {
-                        start_time: start,
-                        end_time: end,
-                        text: text.replace("\\N", "\n"), // ASS 换行符
-                        style,
-                    });
-                }
-            }
-        }
-
-        tracing::info!("ASS parser: {} events parsed", events.len());
-        events
+        self.parse_document(data)
+            .events
+            .into_iter()
+            .map(|e| e.base)
+            .collect()
     }
 }
 

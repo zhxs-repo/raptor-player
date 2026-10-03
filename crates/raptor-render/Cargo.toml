@@ -12,3 +12,4 @@ winit = { workspace = true }
 pollster = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+raw-window-handle = "0.6"

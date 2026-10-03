@@ -8,13 +8,18 @@ use parking_lot::Mutex;
 use raptor_ffmpeg::Packet;
 use raptor_subtitle::{SubtitleEngine, SubtitleEvent};
 
+use crate::seek::{recv_current, Stamped};
+
 /// 字幕默认显示时长（秒）
 const DEFAULT_SUBTITLE_DURATION: f64 = 3.0;
+
+/// 字幕包接收超时
+const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// 字幕解码线程 — 读取 subtitle packets，解析文本，送入 SubtitleEngine
 pub fn subtitle_decode_loop(
     pipeline: Arc<crate::pipeline::Pipeline>,
-    subtitle_pkt_rx: Receiver<Packet>,
+    subtitle_pkt_rx: Receiver<Stamped<Packet>>,
     subtitle_engine: Arc<Mutex<SubtitleEngine>>,
     is_text_subtitle: bool,
 ) -> raptor_core::Result<()> {
@@ -23,14 +28,36 @@ pub fn subtitle_decode_loop(
     let mut events: Vec<SubtitleEvent> = Vec::new();
     let mut prev_pts: Option<f64> = None;
     let mut prev_text: Option<String> = None;
+    let mut last_seek_gen: u64 = pipeline.seek_generation.load(Ordering::Acquire);
 
     loop {
         if pipeline.shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        match subtitle_pkt_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(pkt) => {
+        let seek_gen = pipeline.seek_generation.load(Ordering::Acquire);
+        if seek_gen != last_seek_gen {
+            last_seek_gen = seek_gen;
+            // 上一条字幕的结束时间本应由下一个包决定，seek 后不会再来了；
+            // 事件带绝对时间戳，按默认时长收尾即可，直接丢弃会少一条字幕
+            if let (Some(pts), Some(text)) = (prev_pts.take(), prev_text.take()) {
+                events.push(SubtitleEvent {
+                    start_time: pts,
+                    end_time: pts + DEFAULT_SUBTITLE_DURATION,
+                    text,
+                    style: "Default".to_string(),
+                });
+            }
+        }
+
+        match recv_current(&subtitle_pkt_rx, seek_gen, RECV_TIMEOUT) {
+            Ok(stamped) => {
+                let pkt = stamped.item;
+                // 无时间戳的字幕包无法定位显示时间，直接跳过（不得当成 0 秒）
+                let Some(pkt_pts) = pkt.pts_secs() else {
+                    tracing::debug!("subtitle packet without pts, skipped");
+                    continue;
+                };
                 let text = if is_text_subtitle {
                     extract_text_from_subtitle_packet(&pkt)
                 } else {
@@ -44,8 +71,8 @@ pub fn subtitle_decode_loop(
                         if let (Some(prev_pts), Some(prev_text)) =
                             (prev_pts.take(), prev_text.take())
                         {
-                            let end_time = if pkt.pts > prev_pts && pkt.pts - prev_pts < 30.0 {
-                                pkt.pts
+                            let end_time = if pkt_pts > prev_pts && pkt_pts - prev_pts < 30.0 {
+                                pkt_pts
                             } else {
                                 prev_pts + DEFAULT_SUBTITLE_DURATION
                             };
@@ -56,7 +83,7 @@ pub fn subtitle_decode_loop(
                                 style: "Default".to_string(),
                             });
                         }
-                        prev_pts = Some(pkt.pts);
+                        prev_pts = Some(pkt_pts);
                         prev_text = Some(text);
                     }
                 }
@@ -128,6 +155,18 @@ fn extract_text_from_subtitle_packet(pkt: &Packet) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// 构造测试用字幕包（时间基 1/1000，pts 单位为毫秒）
+    fn sub_packet(pts: Option<i64>, data: Vec<u8>) -> Packet {
+        Packet {
+            data,
+            stream_index: 0,
+            pts,
+            dts: pts,
+            time_base: raptor_ffmpeg::time_base(1, 1000),
+            is_key: false,
+        }
+    }
+
     #[test]
     fn test_extract_mov_text() {
         // mov_text: 2 bytes length (big-endian) + text
@@ -136,27 +175,16 @@ mod tests {
         let mut data = vec![(len >> 8) as u8, (len & 0xFF) as u8];
         data.extend_from_slice(text.as_bytes());
 
-        let pkt = Packet {
-            data,
-            stream_index: 0,
-            pts: 1.0,
-            dts: 1.0,
-            is_key: false,
-        };
+        let pkt = sub_packet(Some(1000), data);
 
         let result = extract_text_from_subtitle_packet(&pkt);
         assert_eq!(result, Some("Hello World".to_string()));
+        assert!((pkt.pts_secs().unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_extract_plain_text() {
-        let pkt = Packet {
-            data: b"plain subtitle text".to_vec(),
-            stream_index: 0,
-            pts: 2.0,
-            dts: 2.0,
-            is_key: false,
-        };
+        let pkt = sub_packet(Some(2000), b"plain subtitle text".to_vec());
 
         let result = extract_text_from_subtitle_packet(&pkt);
         assert_eq!(result, Some("plain subtitle text".to_string()));
@@ -164,15 +192,11 @@ mod tests {
 
     #[test]
     fn test_extract_empty_packet() {
-        let pkt = Packet {
-            data: vec![],
-            stream_index: 0,
-            pts: 0.0,
-            dts: 0.0,
-            is_key: false,
-        };
+        let pkt = sub_packet(None, vec![]);
 
         let result = extract_text_from_subtitle_packet(&pkt);
         assert_eq!(result, None);
+        // NOPTS 包不得被解释成 0 秒
+        assert_eq!(pkt.pts_secs(), None);
     }
 }

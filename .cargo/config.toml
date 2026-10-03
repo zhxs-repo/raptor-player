@@ -1,2 +1,22 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# ── Android cross-compilation ──────────────────────────────────────
+#
+# NDK r28 @ D:\Devs\android_sdk\ndk\28.2.13676358
+# API level 24 (Android 7.0)
+#
+# Build with cargo-ndk (recommended):
+#   cargo ndk -t arm64-v8a -o ./android/app/src/main/jniLibs build --release
+#
+# Or manually:
+#   cargo build --target aarch64-linux-android --release
+
+[target.aarch64-linux-android]
+linker = "D:\\Devs\\android_sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android24-clang.cmd"
+
+# [env] section — uncomment ONLY when cross-compiling for Android,
+# then re-comment after. Otherwise Windows builds may break.
+# [env]
+# BINDGEN_EXTRA_CLANG_ARGS = "-isystem D:\\Devs\\android_sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\sysroot\\usr\\include --target=aarch64-linux-android"
+# CARGO_NDK_SYSROOT_PATH = "D:\\Devs\\android_sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\sysroot"

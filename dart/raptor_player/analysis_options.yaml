@@ -1,0 +1,8 @@
+include: package:lints/recommended.yaml
+
+linter:
+  rules:
+    prefer_single_quotes: true
+    sort_constructors_first: false
+    unawaited_futures: true
+    library_private_types_in_public_api: false
