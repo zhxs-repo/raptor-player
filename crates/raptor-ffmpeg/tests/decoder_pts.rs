@@ -96,6 +96,15 @@ fn audio_frame_pts_uses_sample_rate_timebase() {
         decoder.submit_packet(&pkt).expect("submit");
         while let Some(frame) = decoder.receive_frame().expect("receive") {
             frames_total += 1;
+            // 静音缺陷回归点：AAC 输出帧不填 ch_layout，早期实现按 0 声道计算，
+            // 每帧的 samples 都是空的，声音通路整条链路静默
+            assert!(
+                frame.channels > 0 && !frame.samples.is_empty(),
+                "decoded audio frame must carry samples (pts={:?}, channels={}, len={})",
+                frame.pts,
+                frame.channels,
+                frame.samples.len()
+            );
             assert_eq!(
                 (frame.time_base.numerator(), frame.time_base.denominator()),
                 (1, sample_rate as i32),

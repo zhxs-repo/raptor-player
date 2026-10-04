@@ -132,9 +132,58 @@ fn load_nonexistent_does_not_send_file_loaded() {
         url: "nonexistent.mp4".into(),
     });
 
-    // Should NOT receive FileLoaded event
-    let event = rx.try_recv();
-    assert!(event.is_err()); // No event in channel
+    // 失败会上报 Error 事件，但绝不应出现 FileLoaded
+    let event = rx.try_recv().expect("加载失败应有事件");
+    assert!(
+        matches!(event, RaptorEvent::Error { .. }),
+        "应为 Error 事件，实际 {event:?}"
+    );
+}
+
+#[test]
+fn failed_load_reports_error_event_and_error_state() {
+    use raptor_core::{ErrorCode, PlayerState};
+
+    let (player, mut rx) = make_player();
+    assert_eq!(player.state(), PlayerState::Idle);
+
+    let err = player
+        .dispatch_command(Command::LoadFile {
+            url: "no_such_file.mp4".into(),
+        })
+        .unwrap_err();
+
+    let event = rx
+        .try_recv()
+        .expect("失败必须作为事件发出，而不是只返回错误码");
+    match event {
+        RaptorEvent::Error { code, message } => {
+            assert_eq!(code, ErrorCode::FileNotFound as i32);
+            assert!(message.contains("no_such_file.mp4"), "message={message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    assert_eq!(err.error_code(), ErrorCode::FileNotFound);
+    // 状态收敛到 Error，而不是卡在 Loading
+    assert_eq!(player.state(), PlayerState::Error);
+}
+
+#[test]
+fn error_state_rejects_play_until_reload() {
+    use raptor_core::PlayerState;
+
+    let (player, _rx) = make_player();
+    let _ = player.dispatch_command(Command::LoadFile {
+        url: "no_such_file.mp4".into(),
+    });
+    assert_eq!(player.state(), PlayerState::Error);
+
+    // 出错后不能直接播放（避免用旧 pipeline 的残骸继续跑）
+    assert!(player.dispatch_command(Command::Play).is_err());
+    assert_eq!(player.state(), PlayerState::Error);
+    // 但停止与重新加载都应当可用
+    assert!(player.dispatch_command(Command::Stop).is_ok());
+    assert_eq!(player.state(), PlayerState::Stopped);
 }
 
 // === Load + Re-load State Recovery ===

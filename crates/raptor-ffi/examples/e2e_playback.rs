@@ -3,7 +3,7 @@
 //! 验证: Load → Play → Pause → Seek → Resume → Stop
 //! 运行: `cargo run --example e2e_playback -p raptor-ffi -- test_video.mp4`
 
-use raptor_core::{Command, RaptorEvent, SeekMode};
+use raptor_core::{Command, PlayerState, RaptorEvent, SeekMode};
 use raptor_ffi::Player;
 
 fn main() {
@@ -114,6 +114,25 @@ fn main() {
     );
 
     // ================================================================
+    // Step 2.5: Mute（静音只压增益，不能停主时钟）
+    // ================================================================
+    println!("\n--- Step 2.5: Mute ---");
+    let mute_result = player.dispatch_command(Command::SetMute { muted: true });
+    check!("SetMute(true) succeeds", mute_result.is_ok());
+
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let pos_while_muted = player.get_hud_stats().position_secs;
+    check!(
+        &format!(
+            "Position keeps advancing while muted ({pos_after_play:.2}s -> {pos_while_muted:.2}s)"
+        ),
+        pos_while_muted > pos_after_play
+    );
+
+    let unmute_result = player.dispatch_command(Command::SetMute { muted: false });
+    check!("SetMute(false) succeeds", unmute_result.is_ok());
+
+    // ================================================================
     // Step 3: Pause
     // ================================================================
     println!("\n--- Step 3: Pause ---");
@@ -142,6 +161,30 @@ fn main() {
             "Position frozen while paused (pause={pos_at_pause:.2}s, after={pos_after_wait:.2}s)"
         ),
         (pos_after_wait - pos_at_pause).abs() < 0.1
+    );
+
+    // 看门狗回归：暂停比停滞预算（2s）更久不能被判成卡死 ——
+    // 暂停期间没有输入是预期行为，误报会让前端弹出错误界面
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let mut watchdog_error = None;
+    while let Ok(event) = event_rx.try_recv() {
+        if let RaptorEvent::Error { message, .. } = event {
+            watchdog_error = Some(message);
+        }
+    }
+    check!(
+        &format!(
+            "Long pause does not trip the stall watchdog (got {:?})",
+            watchdog_error
+        ),
+        watchdog_error.is_none()
+    );
+    check!(
+        &format!(
+            "State still Paused after long pause (got {:?})",
+            player.state()
+        ),
+        player.state() == PlayerState::Paused
     );
 
     // ================================================================
@@ -200,6 +243,38 @@ fn main() {
         ),
         positions[positions.len() - 1] >= positions[0]
     );
+
+    // ================================================================
+    // Step 5.5: 自然播放到末尾（EOF 由媒体主时钟判定，不是挂钟）
+    // ================================================================
+    println!("\n--- Step 5.5: Play to EOF ---");
+    let mut eof_position: Option<f64> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while eof_position.is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, RaptorEvent::EndFile { .. }) {
+                eof_position = Some(player.get_hud_stats().position_secs);
+            }
+        }
+    }
+    match eof_position {
+        Some(pos) => {
+            check!(
+                &format!("EndFile(Eof) fired near the real end (position {pos:.2}s)"),
+                pos > 4.5
+            );
+            check!(
+                &format!("Position reached file duration at EOF (got {pos:.2}s)"),
+                (pos - 5.0).abs() < 0.5
+            );
+        }
+        None => {
+            let pos = player.get_hud_stats().position_secs;
+            println!("  [FAIL] No EndFile within 8s (position stuck at {pos:.2}s)");
+            failed += 1;
+        }
+    }
 
     // ================================================================
     // Step 6: Stop (Stop 不发送 EndFile，EndFile 仅由自然播放到末尾触发)

@@ -3,7 +3,7 @@
 //! 此测试不需要真实视频文件或 GPU 窗口，仅验证核心逻辑。
 //! 运行: `cargo run --example smoke_test -p raptor-ffi`
 
-use raptor_core::{Command, RaptorError, SeekMode};
+use raptor_core::{Command, ErrorCode, PlayerState, RaptorError, RaptorEvent, SeekMode};
 use raptor_ffi::Player;
 
 fn main() {
@@ -60,12 +60,42 @@ fn main() {
     } else {
         assert_test!("error is FileNotFound", false);
     }
+    // 失败必须让状态收敛到 Error（历史上的缺陷是留在 Loading 永不返回）
+    assert_test!(
+        &format!("failed load lands in Error (got {:?})", player.state()),
+        player.state() == PlayerState::Error
+    );
+    // 并且要作为事件出去，前端不必逐条命令轮询返回值
+    let mut saw_error_event = false;
+    while let Ok(event) = rx.try_recv() {
+        if let RaptorEvent::Error { code, .. } = event {
+            saw_error_event = code == ErrorCode::FileNotFound as i32;
+        }
+    }
+    assert_test!("failure emits Error event", saw_error_event);
 
-    // --- 5. Seek 负数 ---
-    println!("\n--- 5. Seek Negative Target ---");
+    // --- 5. Error 态：可以 Stop 退出，但不能直接播 ---
+    println!("\n--- 5. Error State Recovery ---");
+    let result = player.dispatch_command(Command::Play);
+    assert_test!("Play in Error returns error", result.is_err());
+    let result = player.dispatch_command(Command::Stop);
+    assert_test!(
+        &format!(
+            "Stop exits Error (ok={}, {:?})",
+            result.is_ok(),
+            player.state()
+        ),
+        result.is_ok() && player.state() == PlayerState::Stopped
+    );
+
+    // --- 6. Idle 状态下的非法命令（新实例，未被上面的失败污染）---
+    println!("\n--- 6. Illegal Commands in Idle ---");
+    let (idle_tx, _idle_rx) = tokio::sync::mpsc::unbounded_channel();
+    let idle_player = Player::new(idle_tx);
+
     // 需要先让播放器进入可 seek 状态，这需要一个有效的 pipeline
     // 在 Idle 状态下 seek 会先被状态机拒绝
-    let result = player.dispatch_command(Command::Seek {
+    let result = idle_player.dispatch_command(Command::Seek {
         target: -1.0,
         mode: SeekMode::Absolute,
     });
@@ -74,24 +104,25 @@ fn main() {
         result.is_err()
     );
 
-    // --- 6. TogglePause 在 Idle 应失败 ---
-    println!("\n--- 6. TogglePause in Idle ---");
-    let result = player.dispatch_command(Command::TogglePause);
+    let result = idle_player.dispatch_command(Command::TogglePause);
     assert_test!("TogglePause in Idle returns error", result.is_err());
 
-    // --- 7. Stop 在 Idle 应失败 ---
-    println!("\n--- 7. Stop in Idle ---");
-    let result = player.dispatch_command(Command::Stop);
+    let result = idle_player.dispatch_command(Command::Stop);
     assert_test!("Stop in Idle returns error", result.is_err());
 
-    // --- 8. Quit 应成功 ---
-    println!("\n--- 8. Quit ---");
+    // --- 7. Quit 应成功 ---
+    println!("\n--- 7. Quit ---");
     let result = player.dispatch_command(Command::Quit);
     assert_test!("Quit succeeds", result.is_ok());
 
-    // 检查是否收到 End 事件
-    let event = rx.try_recv();
-    assert_test!("End event received", event.is_ok());
+    // 事件通道里还有步骤 4 的 Error 事件，只要能看到 End 就行
+    let mut saw_end = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, RaptorEvent::End) {
+            saw_end = true;
+        }
+    }
+    assert_test!("End event received", saw_end);
 
     // --- 结果汇总 ---
     println!("\n=== Results: {} passed, {} failed ===", passed, failed);

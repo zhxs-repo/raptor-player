@@ -42,7 +42,9 @@ use raptor_subtitle::{SubtitleConfig, SubtitleEngine};
 
 /// 播放器核心 — 持有状态机 + pipeline + 属性存储
 pub struct Player {
-    state: Mutex<PlayerState>,
+    /// 状态机。用 `Arc` 是因为管线线程的事件转发回路也要写它：
+    /// 工作线程崩溃时没有命令在返回，错误只能从事件侧把状态收敛到 `Error`
+    state: Arc<Mutex<PlayerState>>,
     properties: Arc<DefaultPropertyStore>,
     event_tx: tokio::sync::mpsc::UnboundedSender<RaptorEvent>,
     pipeline: Mutex<Option<Arc<Pipeline>>>,
@@ -63,7 +65,7 @@ impl Player {
     pub fn new(event_tx: tokio::sync::mpsc::UnboundedSender<RaptorEvent>) -> Self {
         let properties = Arc::new(DefaultPropertyStore::new(event_tx.clone()));
         Self {
-            state: Mutex::new(PlayerState::Idle),
+            state: Arc::new(Mutex::new(PlayerState::Idle)),
             properties,
             event_tx,
             pipeline: Mutex::new(None),
@@ -74,6 +76,40 @@ impl Player {
             pending_surface: Mutex::new(None),
             renderer_cmd_tx: Mutex::new(None),
         }
+    }
+
+    /// 状态写入集中点：非法转换只记日志并保持原状态，不静默改写
+    ///
+    /// 写成关联函数而非 `&self` 方法，因为事件转发线程只持有 `state` 的 `Arc`。
+    fn write_state(state: &Mutex<PlayerState>, next: PlayerState) {
+        let mut guard = state.lock();
+        match guard.transition_to(next) {
+            Ok(()) => {
+                if *guard != next {
+                    tracing::debug!("state: {} -> {}", *guard, next);
+                    *guard = next;
+                }
+            }
+            Err(e) => tracing::error!("state write rejected: {e}"),
+        }
+    }
+
+    /// 失败集中处理：发出 `RaptorEvent::Error` 并把状态收敛到 `Error`
+    ///
+    /// 原样返回传入的错误，调用处可以写 `return Err(self.fail(e))`。
+    fn fail(&self, e: RaptorError) -> RaptorError {
+        tracing::error!("player failure: {e}");
+        let _ = self.event_tx.send(RaptorEvent::Error {
+            code: e.error_code() as i32,
+            message: e.to_string(),
+        });
+        Self::write_state(&self.state, PlayerState::Error);
+        e
+    }
+
+    /// 当前状态机状态
+    pub fn state(&self) -> PlayerState {
+        *self.state.lock()
     }
 
     /// 处理命令
@@ -90,6 +126,13 @@ impl Player {
                     .set("volume", PropertyValue::Int(volume as i64));
                 if let Some(pipeline) = self.pipeline.lock().as_ref() {
                     pipeline.set_volume(volume);
+                }
+                Ok(CommandResult::Empty)
+            }
+            Command::SetMute { muted } => {
+                self.properties.set("muted", PropertyValue::Bool(muted));
+                if let Some(pipeline) = self.pipeline.lock().as_ref() {
+                    pipeline.set_mute(muted);
                 }
                 Ok(CommandResult::Empty)
             }
@@ -117,32 +160,23 @@ impl Player {
     }
 
     fn load_file(&self, url: &str) -> raptor_core::Result<CommandResult> {
-        let prev_state = {
-            let state = self.state.lock();
-            state
-                .can_transition_to(&PlayerEvent::Load {
-                    url: url.to_string(),
-                })
-                .map_err(RaptorError::InvalidState)?;
-            state.clone()
-        };
+        self.state
+            .lock()
+            .can_transition_to(&PlayerEvent::Load {
+                url: url.to_string(),
+            })
+            .map_err(RaptorError::InvalidState)?;
 
         // 先停止旧 pipeline
         self.stop_pipeline();
 
         // 文件存在性预检查 — 提供明确的 FileNotFound 错误
         if !std::path::Path::new(url).exists() {
-            // 状态回退到可重新加载的状态
-            *self.state.lock() = if matches!(prev_state, PlayerState::Idle) {
-                PlayerState::Idle
-            } else {
-                PlayerState::Stopped
-            };
-            return Err(RaptorError::FileNotFound(url.to_string()));
+            return Err(self.fail(RaptorError::FileNotFound(url.to_string())));
         }
 
-        // 转为 Loading；后续任何失败统一回滚为 Stopped，避免 handle 卡死在 Loading
-        *self.state.lock() = PlayerState::Loading;
+        // 转为 Loading；后续任何失败统一进入 Error 终态，避免 handle 卡死在 Loading
+        Self::write_state(&self.state, PlayerState::Loading);
         let result = (|| -> raptor_core::Result<CommandResult> {
             // 打开文件获取信息
             let mut demuxer = FfmpegDemuxer::new();
@@ -225,7 +259,7 @@ impl Player {
             let mut pipeline = Pipeline::new(crossbeam_tx);
             pipeline.pause(); // 创建后先暂停，等 Play 命令再恢复
             tracing::info!("load_file: calling pipeline.start()...");
-            match pipeline.start(
+            if let Err(e) = pipeline.start(
                 url,
                 Box::new(demuxer),
                 shared_renderer,
@@ -235,14 +269,10 @@ impl Player {
                 self.subtitle_engine.lock().clone(),
                 Some(renderer_cmd_rx),
             ) {
-                Ok(()) => tracing::info!("load_file: pipeline.start() returned Ok"),
-                Err(e) => {
-                    tracing::error!("load_file: pipeline.start() FAILED: {}", e);
-                    // 状态回退，允许重新加载
-                    *self.state.lock() = PlayerState::Stopped;
-                    return Err(e);
-                }
+                tracing::error!("load_file: pipeline.start() FAILED: {}", e);
+                return Err(e);
             }
+            tracing::info!("load_file: pipeline.start() returned Ok");
             let pipeline = Arc::new(pipeline);
 
             *self.pipeline.lock() = Some(pipeline.clone());
@@ -255,10 +285,16 @@ impl Player {
 
             // 转发 crossbeam 事件到 tokio channel
             let event_tx = self.event_tx.clone();
+            let state = self.state.clone();
             std::thread::Builder::new()
                 .name("raptor-evt-fwd".into())
                 .spawn(move || {
                     while let Ok(event) = crossbeam_rx.recv() {
+                        // 管线线程崩溃的错误只从这里出去，此时没有任何命令在返回：
+                        // 状态必须跟着收敛到 Error，否则前端看到的还是 Playing
+                        if matches!(event, RaptorEvent::Error { .. }) {
+                            Self::write_state(&state, PlayerState::Error);
+                        }
                         if event_tx.send(event).is_err() {
                             break;
                         }
@@ -267,7 +303,7 @@ impl Player {
                 .ok();
 
             // 状态转换 → Ready
-            *self.state.lock() = PlayerState::Ready;
+            Self::write_state(&self.state, PlayerState::Ready);
 
             // 初始化 position 属性
             self.properties.set("position", PropertyValue::Float(0.0));
@@ -286,11 +322,13 @@ impl Player {
                 audio: audio_info,
             }))
         })();
-        if result.is_err() {
-            *self.state.lock() = PlayerState::Stopped;
-            self.stop_pipeline();
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.stop_pipeline();
+                Err(self.fail(e))
+            }
         }
-        result
     }
 
     fn play(&self) -> raptor_core::Result<CommandResult> {
@@ -305,7 +343,7 @@ impl Player {
             pipeline.resume();
         }
 
-        *self.state.lock() = PlayerState::Playing;
+        Self::write_state(&self.state, PlayerState::Playing);
         let _ = self.event_tx.send(RaptorEvent::PlaybackRestart);
         Ok(CommandResult::Empty)
     }
@@ -330,13 +368,13 @@ impl Player {
             pipeline.pause();
         }
 
-        *self.state.lock() = PlayerState::Paused;
+        Self::write_state(&self.state, PlayerState::Paused);
         self.properties.set("position", PropertyValue::Float(pos));
         Ok(CommandResult::Empty)
     }
 
     fn toggle_pause(&self) -> raptor_core::Result<CommandResult> {
-        let state = self.state.lock().clone();
+        let state = self.state();
         match state {
             PlayerState::Playing => self.pause(),
             PlayerState::Paused => self.play(),
@@ -355,7 +393,7 @@ impl Player {
         drop(state);
 
         self.stop_pipeline();
-        *self.state.lock() = PlayerState::Stopped;
+        Self::write_state(&self.state, PlayerState::Stopped);
         Ok(CommandResult::Empty)
     }
 

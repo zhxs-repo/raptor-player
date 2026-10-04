@@ -52,6 +52,8 @@ pub fn demux_loop(
         match demuxer.read_packet() {
             Ok(Some(pkt)) => {
                 pkt_count += 1;
+                // 看门狗心跳：只要这里在动，下游收不到数据就只是"这条流没数据了"
+                pipeline.demux_progress.store(pkt_count, Ordering::Release);
                 if pkt_count.is_multiple_of(100) {
                     tracing::info!("demux: read {} packets", pkt_count);
                 }

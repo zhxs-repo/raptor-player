@@ -3,9 +3,28 @@
 //! 两个渲染器只有 surface 来源不同（自管窗口 vs 宿主注入），
 //! 视频上传/绘制的 GPU 资源构造完全一致，统一收敛到这里避免双份维护。
 
+use raptor_ffmpeg::VideoFrame;
+
+/// `ColorParams` uniform 的字节数（matrix + full_range + 8 字节填充）
+const COLOR_PARAMS_SIZE: u64 = 16;
+
+/// 由帧的色彩元数据生成 uniform 内容
+///
+/// 布局必须与 `yuv_to_rgb.wgsl` 的 `ColorParams` 一致；uniform 按宿主字节序读取，
+/// 所以用 `to_ne_bytes`
+pub(crate) fn color_params_bytes(frame: &VideoFrame) -> [u8; COLOR_PARAMS_SIZE as usize] {
+    let matrix = frame.yuv_matrix().shader_index().to_ne_bytes();
+    let full = u32::from(frame.is_full_range()).to_ne_bytes();
+    let mut bytes = [0u8; COLOR_PARAMS_SIZE as usize];
+    bytes[0..4].copy_from_slice(&matrix);
+    bytes[4..8].copy_from_slice(&full);
+    bytes
+}
+
 /// 构建 YUV 渲染所需的管线、绑定组与纹理。
 ///
 /// `label_prefix` 用于区分调试标签来源（如 "ext"），空串则不加前缀。
+/// 返回的色彩 uniform 初始为 BT.601 limited，每帧由 `color_params_bytes` 更新。
 pub(crate) fn setup_yuv_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
@@ -17,6 +36,7 @@ pub(crate) fn setup_yuv_pipeline(
     wgpu::BindGroup,
     wgpu::Texture,
     wgpu::Texture,
+    wgpu::Buffer,
 ) {
     let lbl = |name: &str| -> String {
         if label_prefix.is_empty() {
@@ -67,6 +87,12 @@ pub(crate) fn setup_yuv_pipeline(
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
+    let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&lbl("yuv_color_params")),
+        size: COLOR_PARAMS_SIZE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(&lbl("yuv_bind_group_layout")),
         entries: &[
@@ -96,6 +122,16 @@ pub(crate) fn setup_yuv_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(COLOR_PARAMS_SIZE),
+                },
+                count: None,
+            },
         ],
     });
     let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -115,6 +151,10 @@ pub(crate) fn setup_yuv_pipeline(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: color_buffer.as_entire_binding(),
             },
         ],
     });
@@ -156,7 +196,13 @@ pub(crate) fn setup_yuv_pipeline(
         multiview_mask: None,
         cache: None,
     });
-    (render_pipeline, bind_group, y_texture, uv_texture)
+    (
+        render_pipeline,
+        bind_group,
+        y_texture,
+        uv_texture,
+        color_buffer,
+    )
 }
 
 /// 把平面 U/V 数据按 stride 交织成 RG8 纹理所需的行主序字节
@@ -191,6 +237,41 @@ pub(crate) fn interleave_uv_planes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raptor_ffmpeg::{ColorPrimaries, ColorRange, ColorSpace, PixelFormat};
+
+    fn frame(space: ColorSpace, range: ColorRange, width: u32, height: u32) -> VideoFrame {
+        VideoFrame {
+            pts: Some(0),
+            time_base: raptor_ffmpeg::time_base(1, 90000),
+            width,
+            height,
+            format: PixelFormat::Yuv420p,
+            color_space: space,
+            color_primaries: ColorPrimaries::Unspecified,
+            color_range: range,
+            planes: vec![],
+        }
+    }
+
+    /// uniform 布局是 Rust ↔ WGSL 的约定：matrix 在 [0..4]、full_range 在 [4..8]
+    #[test]
+    fn color_params_bytes_layout() {
+        let bytes = color_params_bytes(&frame(ColorSpace::Bt709, ColorRange::Full, 1920, 1080));
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_ne_bytes(bytes[4..8].try_into().unwrap()), 1);
+        assert!(bytes[8..].iter().all(|&b| b == 0));
+
+        // 未标注：矩阵走分辨率回退，量程走 limited
+        let sd = color_params_bytes(&frame(
+            ColorSpace::Unspecified,
+            ColorRange::Unspecified,
+            640,
+            360,
+        ));
+        assert_eq!(u32::from_ne_bytes(sd[0..4].try_into().unwrap()), 0);
+        assert_eq!(u32::from_ne_bytes(sd[4..8].try_into().unwrap()), 0);
+    }
 
     #[test]
     fn test_interleave_uv_planes() {

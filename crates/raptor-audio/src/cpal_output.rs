@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::clock::AudioClock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use parking_lot::Mutex;
@@ -20,13 +21,53 @@ pub trait AudioOutput: Send {
 
     /// 获取当前音量
     fn volume(&self) -> f32;
+
+    /// 现在写入这一帧放得下吗？
+    ///
+    /// 供调用方做背压：装不下就先不取新帧，而不是在 `write` 里丢采样。
+    /// 默认 `true`：无法预知缓冲容量的实现不拦写入。
+    fn accepts(&self, _frame: &AudioFrame) -> bool {
+        true
+    }
+
+    /// 音频主时钟句柄；输出实现无法提供位置信息时返回 `None`
+    ///
+    /// 返回的句柄与输出侧共享同一份状态，`AVSync` 用它替代挂钟做主时钟。
+    fn clock(&self) -> Option<AudioClock> {
+        None
+    }
+
+    /// 冻结设备消费（暂停播放时必须调用，否则设备会把缓冲里的采样继续放完）
+    fn pause(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 恢复设备消费
+    fn resume(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 丢弃缓冲里尚未播放的采样（seek / stop）
+    ///
+    /// 同时清空主时钟的未播计数：这些采样永远不会到达扬声器。
+    fn flush(&mut self) {}
+
+    /// 是否还有已写入但尚未交给设备的采样
+    ///
+    /// 音频流读到末尾时调用方要等它排空再退出：立刻 drop 掉输出会把缓冲里
+    /// 最后的采样连同设备一起丢掉，结尾被截断，主时钟也停在片长之前。
+    /// 默认 `false`：不维护缓冲的实现无需等待。
+    fn has_pending_audio(&self) -> bool {
+        false
+    }
 }
 
 /// cpal 音频输出实现
 ///
 /// 使用共享 `VecDeque<f32>` 作为 ring buffer，
 /// audio_output_loop 写入，cpal 回调读取。
-/// ring buffer 有固定上限，超出时丢弃最老的采样，防止 OOM。
+/// ring buffer 有固定上限；写满时由 `accepts` 拦住调用方（背压），
+/// 只有设备长时间不取采样时才丢最老的采样兜底。
 pub struct CpalOutput {
     stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<VecDeque<f32>>>,
@@ -34,6 +75,11 @@ pub struct CpalOutput {
     sample_rate: u32,                          // 源采样率（FFmpeg 输出）
     device_rate: u32,                          // 设备采样率（cpal 实际播放）
     channels: u32,
+    /// 设备声道数：ring buffer 按设备帧的交错布局存放采样，
+    /// 与源声道数不同（如单声道内容放到立体声设备）时必须展开，否则设备
+    /// 每次回调取走的帧数与写入侧记账不一致，主时钟和播放速度都会错乱
+    device_channels: usize,
+    clock: AudioClock,
 }
 
 /// Ring buffer 容量上限：约 1 秒的立体声 48kHz 采样
@@ -52,12 +98,35 @@ impl CpalOutput {
             sample_rate: 0,
             device_rate: 0,
             channels: 0,
+            device_channels: 0,
+            clock: AudioClock::new(),
         }
     }
 
     /// 获取共享 buffer 引用（供 audio_output_loop 直接写入）
     pub fn buffer(&self) -> Arc<Mutex<VecDeque<f32>>> {
         self.buffer.clone()
+    }
+
+    /// 这一帧写入后会占用多少**设备帧**（按输出采样率换算）
+    fn device_frames_for(&self, frame: &AudioFrame) -> usize {
+        let ch = frame.channels.max(1) as usize;
+        let src_frames = frame.samples.len() / ch;
+        if self.device_rate == 0 || self.sample_rate == self.device_rate {
+            src_frames
+        } else {
+            let ratio = self.device_rate as f64 / self.sample_rate as f64;
+            (src_frames as f64 * ratio).ceil() as usize
+        }
+    }
+
+    /// ring buffer 里每个设备帧占多少采样（未 init 时按源声道数）
+    fn out_channels(&self, frame: &AudioFrame) -> usize {
+        if self.device_channels == 0 {
+            frame.channels.max(1) as usize
+        } else {
+            self.device_channels
+        }
     }
 }
 
@@ -97,10 +166,16 @@ impl AudioOutput for CpalOutput {
         );
 
         self.device_rate = device_sample_rate;
+        self.device_channels = device_channels.max(1) as usize;
+        self.clock.set_rate(device_sample_rate);
 
         let config: cpal::StreamConfig = supported_config.into();
         let buffer = self.buffer.clone();
         let volume = self.volume.clone();
+        // 设备每次取走的帧数记入主时钟：位置 = 写入终点 − 尚未播放的时长
+        let out_channels = config.channels.max(1) as usize;
+        let clock_f32 = self.clock.clone();
+        let clock_i16 = self.clock.clone();
 
         // 根据设备支持的采样格式构建流
         let stream = match device_format {
@@ -112,6 +187,7 @@ impl AudioOutput for CpalOutput {
                     for sample in data.iter_mut() {
                         *sample = buf.pop_front().unwrap_or(0.0) * vol;
                     }
+                    clock_f32.on_consume((data.len() / out_channels) as u64);
                 },
                 move |err| tracing::error!("cpal output stream error: {}", err),
                 None,
@@ -125,6 +201,7 @@ impl AudioOutput for CpalOutput {
                         let s = buf.pop_front().unwrap_or(0.0) * vol;
                         *sample = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                     }
+                    clock_i16.on_consume((data.len() / out_channels) as u64);
                 },
                 move |err| tracing::error!("cpal output stream error: {}", err),
                 None,
@@ -147,31 +224,41 @@ impl AudioOutput for CpalOutput {
     }
 
     fn write(&mut self, frame: &AudioFrame) -> Result<()> {
+        let src_ch = frame.channels.max(1) as usize;
+        let src_frames = frame.samples.len() / src_ch;
+        let dev_ch = self.out_channels(frame);
+        let pushed_device_frames = self.device_frames_for(frame);
         let mut buf = self.buffer.lock();
-        if self.sample_rate == self.device_rate || self.device_rate == 0 {
-            // 采样率匹配，直接推入
+
+        if pushed_device_frames == src_frames && dev_ch == src_ch {
+            // 采样率与声道数都和源一致，直接推入
             buf.extend(frame.samples.iter());
         } else {
-            // 线性重采样：source_rate → device_rate
-            let channels = self.channels as usize;
-            let ratio = self.device_rate as f64 / self.sample_rate as f64;
-            let src_frames = frame.samples.len() / channels;
-            let out_frames = (src_frames as f64 * ratio).ceil() as usize;
+            // 一次遍历同时完成重采样（源采样率 → 设备采样率）与声道映射
+            // （源声道少于设备时复制到各设备声道）。ring buffer 必须按**设备帧**
+            // 的交错布局存放，否则设备回调取走的帧数与这里的记账不一致，
+            // 主时钟和播放速度都会错乱
+            let ratio = if src_frames == 0 {
+                1.0
+            } else {
+                pushed_device_frames as f64 / src_frames as f64
+            };
 
-            for i in 0..out_frames {
+            for i in 0..pushed_device_frames {
                 let src_pos = i as f64 / ratio;
                 let src_idx = src_pos.floor() as usize;
                 let frac = (src_pos - src_idx as f64) as f32;
 
-                for ch in 0..channels {
+                for c in 0..dev_ch {
+                    let ch_i = c % src_ch;
                     let s0 = frame
                         .samples
-                        .get(src_idx * channels + ch)
+                        .get(src_idx * src_ch + ch_i)
                         .copied()
                         .unwrap_or(0.0);
                     let s1 = frame
                         .samples
-                        .get((src_idx + 1) * channels + ch)
+                        .get((src_idx + 1) * src_ch + ch_i)
                         .copied()
                         .unwrap_or(0.0);
                     buf.push_back(s0 + (s1 - s0) * frac);
@@ -179,10 +266,24 @@ impl AudioOutput for CpalOutput {
             }
         }
 
-        // Ring buffer 上限保护：超出时丢弃最老的采样，防止 OOM
-        while buf.len() > MAX_BUFFER_SAMPLES {
-            buf.pop_front();
+        // 兜底上限：调用方已用 `accepts` 做背压，正常不会走到这里。
+        // 真走到（设备被系统挂起等）就丢最老的采样以限制内存占用，
+        // 按整帧丢弃保持交错布局的声道对齐，并同步扣掉主时钟的未播计数
+        let excess = buf.len().saturating_sub(MAX_BUFFER_SAMPLES);
+        let dropped_samples = excess - excess % dev_ch;
+        if dropped_samples > 0 {
+            buf.drain(..dropped_samples);
+            self.clock
+                .on_overflow_drop((dropped_samples / dev_ch) as u64);
+            tracing::warn!("CpalOutput: 缓冲超限，丢弃 {dropped_samples} 个采样");
         }
+
+        // 主时钟：这批设备帧播完后到达的媒体位置
+        let end_pts = match (frame.pts_secs(), frame.sample_rate) {
+            (Some(pts), rate) if rate > 0 => Some(pts + src_frames as f64 / rate as f64),
+            _ => None,
+        };
+        self.clock.on_write(pushed_device_frames as u64, end_pts);
 
         Ok(())
     }
@@ -195,6 +296,50 @@ impl AudioOutput for CpalOutput {
 
     fn volume(&self) -> f32 {
         f32::from_bits(self.volume.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 现在写入这一帧放得下吗？
+    ///
+    /// 供调用方做背压：缓冲快满时先不取新帧，而不是在 `write` 里丢采样。
+    /// 丢采样会让音频一路冲到文件末尾，音频主时钟随之越过视频好几秒。
+    fn accepts(&self, frame: &AudioFrame) -> bool {
+        let needed = self.device_frames_for(frame) * self.out_channels(frame);
+        self.buffer.lock().len() + needed <= MAX_BUFFER_SAMPLES
+    }
+
+    fn clock(&self) -> Option<AudioClock> {
+        Some(self.clock.clone())
+    }
+
+    /// 暂停设备消费
+    ///
+    /// 不暂停的话，缓冲里最多 1 秒的采样会在"已暂停"期间继续放完，
+    /// 音频主时钟也会跟着走完这段并不存在的内容。
+    fn pause(&mut self) -> Result<()> {
+        if let Some(stream) = self.stream.as_mut() {
+            stream
+                .pause()
+                .map_err(|e| RaptorError::Audio(format!("pause stream: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        if let Some(stream) = self.stream.as_mut() {
+            stream
+                .play()
+                .map_err(|e| RaptorError::Audio(format!("play stream: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) {
+        self.buffer.lock().clear();
+        self.clock.reset();
+    }
+
+    fn has_pending_audio(&self) -> bool {
+        !self.buffer.lock().is_empty()
     }
 }
 
@@ -237,5 +382,96 @@ mod tests {
         assert!((samples[0] - 0.25).abs() < 0.001);
         assert!((samples[1] - 0.5).abs() < 0.001);
         assert!((samples[2] - (-0.25)).abs() < 0.001);
+    }
+
+    fn frame(pts_ticks: Option<i64>, samples: Vec<f32>) -> AudioFrame {
+        AudioFrame {
+            pts: pts_ticks,
+            time_base: raptor_ffmpeg::time_base(1, 1000),
+            sample_rate: 1000,
+            channels: 1,
+            format: raptor_ffmpeg::SampleFormat::F32,
+            samples,
+        }
+    }
+
+    /// 写入侧记账：结束 PTS、未播帧数与设备取走量共同决定主时钟读数
+    ///
+    /// `init` 需要真实输出设备，这里直接给时钟设采样率，只验证 write/flush 的换算。
+    #[test]
+    fn write_and_flush_drive_audio_clock() {
+        let mut output = CpalOutput::new();
+        let clock = output.clock().expect("cpal 输出必须提供主时钟");
+        clock.set_rate(1000);
+
+        // pts=2.0s + 1000 采样 @1kHz → 这批采样的结束位置 3.0s，尚未播放 1.0s
+        output
+            .write(&frame(Some(2000), vec![0.0; 1000]))
+            .expect("write");
+        assert!((clock.position().unwrap() - 2.0).abs() < 1e-9);
+
+        // 设备取走一半 → 播放位置向 3.0 推进
+        clock.on_consume(500);
+        assert!((clock.position().unwrap() - 2.5).abs() < 1e-9);
+
+        // flush（seek）：缓冲内容永远不会发声，时钟必须回到不可用状态
+        output.flush();
+        assert_eq!(clock.position(), None);
+        assert!(output.buffer().lock().is_empty());
+    }
+
+    /// 缓冲已满时必须拦住新帧：靠丢弃补帧会让写入侧跑到设备前面
+    #[test]
+    fn accepts_blocks_when_buffer_full() {
+        let mut output = CpalOutput::new();
+        let big = frame(Some(0), vec![0.0; MAX_BUFFER_SAMPLES]);
+        assert!(output.accepts(&big));
+        output.write(&big).unwrap();
+        assert!(
+            !output.accepts(&frame(Some(5000), vec![0.0; 10])),
+            "缓冲已满时必须拦住新帧"
+        );
+    }
+
+    /// 源声道与设备声道不同（单声道内容接立体声设备）时，缓冲必须按设备帧存放：
+    /// 否则设备回调把两个源采样算成一帧取走，主时钟与播放速度都会偏离一倍
+    #[test]
+    fn mono_frame_expands_to_stereo_device() {
+        let mut output = CpalOutput::new();
+        output.sample_rate = 1000;
+        output.device_rate = 1000;
+        output.device_channels = 2;
+        let clock = output.clock().unwrap();
+        clock.set_rate(1000);
+
+        output.write(&frame(Some(0), vec![0.25, -0.25])).unwrap();
+        let buf: Vec<f32> = output.buffer().lock().iter().copied().collect();
+        assert_eq!(
+            buf,
+            vec![0.25, 0.25, -0.25, -0.25],
+            "每个源采样应复制到左右声道"
+        );
+
+        // 2 个设备帧 = 2ms，未播完之前位置就是帧起点 0
+        assert!((clock.position().unwrap() - 0.0).abs() < 1e-9);
+        clock.on_consume(2);
+        assert!((clock.position().unwrap() - 0.002).abs() < 1e-9);
+    }
+
+    /// 无时间戳的帧不得把主时钟拽回 0
+    #[test]
+    fn timestampless_frame_keeps_clock_anchor() {
+        let mut output = CpalOutput::new();
+        let clock = output.clock().unwrap();
+        clock.set_rate(1000);
+        output.write(&frame(Some(5000), vec![0.0; 500])).unwrap();
+        let before = clock.position().unwrap();
+        output.write(&frame(None, vec![0.0; 500])).unwrap();
+        let after = clock.position().unwrap();
+        assert!(
+            after < before,
+            "新增未播采样只推迟位置，基准 PTS 不得变成 0：{before} → {after}"
+        );
+        assert!(after > 4.0, "基准仍是 5.5s 结束位置，got {after}");
     }
 }

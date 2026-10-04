@@ -41,6 +41,11 @@ class RaptorCommands {
     return jsonEncode({'SetVolume': {'volume': volume}});
   }
 
+  /// Mute or unmute. The stored volume is untouched.
+  static String setMute(bool muted) {
+    return jsonEncode({'SetMute': {'muted': muted}});
+  }
+
   /// Load an external subtitle file (SRT/ASS/SSA).
   static String loadSubtitle(String path) {
     return jsonEncode({'LoadSubtitle': {'path': path}});

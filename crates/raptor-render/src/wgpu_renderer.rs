@@ -1,6 +1,6 @@
 use crate::clock::OverlayClock;
 use crate::overlay::OverlayStack;
-use crate::yuv_pipeline::{interleave_uv_planes, setup_yuv_pipeline};
+use crate::yuv_pipeline::{color_params_bytes, interleave_uv_planes, setup_yuv_pipeline};
 use raptor_core::Result;
 use raptor_ffmpeg::{PixelFormat, VideoFrame};
 use std::collections::VecDeque;
@@ -141,6 +141,8 @@ struct WindowRenderer {
     y_texture: wgpu::Texture,
     uv_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    /// 色彩参数 uniform（矩阵 + 量程），每个视频帧更新一次
+    color_params: wgpu::Buffer,
     window_size: (u32, u32),
     last_frame: Option<VideoFrame>,
     /// 已收到但尚未到上屏节拍的视频帧（按序，每节拍取一帧）
@@ -250,7 +252,7 @@ impl WindowRenderer {
         };
         surface.configure(&device, &surface_config);
 
-        let (render_pipeline, bind_group, y_texture, uv_texture) =
+        let (render_pipeline, bind_group, y_texture, uv_texture, color_params) =
             setup_yuv_pipeline(&device, surface_format, width, height, "");
 
         let frame_period = Self::probe_frame_period(&window);
@@ -278,6 +280,7 @@ impl WindowRenderer {
             y_texture,
             uv_texture,
             bind_group,
+            color_params,
             window_size,
             last_frame: None,
             pending_frames: VecDeque::with_capacity(PENDING_FRAME_CAPACITY),
@@ -359,7 +362,7 @@ impl WindowRenderer {
         if frame.width != self.width || frame.height != self.height {
             self.width = frame.width;
             self.height = frame.height;
-            let (pipeline, bg, yt, uvt) = setup_yuv_pipeline(
+            let (pipeline, bg, yt, uvt, cp) = setup_yuv_pipeline(
                 &self.device,
                 self.surface_config.format,
                 frame.width,
@@ -370,7 +373,11 @@ impl WindowRenderer {
             self.bind_group = bg;
             self.y_texture = yt;
             self.uv_texture = uvt;
+            self.color_params = cp;
         }
+        // 矩阵系数与量程写错是画质错误而不是抖动，所以每帧都按帧上的元数据更新
+        self.queue
+            .write_buffer(&self.color_params, 0, &color_params_bytes(frame));
 
         // 上传 Y 平面
         if let (Some(y_tex), Some(y_plane)) = (Some(&self.y_texture), frame.planes.first()) {

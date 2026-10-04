@@ -140,6 +140,9 @@ class RaptorClient {
   void setVolume(int volume) =>
       _sendCommand(RaptorCommands.setVolume(volume));
 
+  /// Mute or unmute. The stored volume is untouched.
+  void setMute(bool muted) => _sendCommand(RaptorCommands.setMute(muted));
+
   /// Load an external subtitle file (SRT/ASS/SSA).
   void loadSubtitle(String path) =>
       _sendCommand(RaptorCommands.loadSubtitle(path));

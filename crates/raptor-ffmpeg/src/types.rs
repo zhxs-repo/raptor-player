@@ -144,6 +144,93 @@ pub struct PlaneData {
     pub stride: usize,
 }
 
+/// Y′CbCr → R′G′B′ 矩阵系数（帧上未标注时为 `Unspecified`，见 `VideoFrame::yuv_matrix`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorSpace {
+    #[default]
+    Unspecified,
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// 色域 primaries — 只保留矩阵回退判定需要的区分
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorPrimaries {
+    #[default]
+    Unspecified,
+    Bt601,
+    Bt709,
+    Bt2020,
+    /// 其余（Film / SMPTE 240M / P3 等）：不足以决定矩阵，交给分辨率启发式
+    Other,
+}
+
+/// 采样量程
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorRange {
+    #[default]
+    Unspecified,
+    /// 16..235 / 128±112（MPEG / TV）
+    Limited,
+    /// 0..255（JPEG / PC）
+    Full,
+}
+
+/// 解析后的矩阵 — 渲染端唯一需要的形式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YuvMatrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+impl YuvMatrix {
+    /// 与 `yuv_to_rgb.wgsl` 里 `ColorParams.matrix` 的取值一一对应
+    pub fn shader_index(self) -> u32 {
+        match self {
+            YuvMatrix::Bt601 => 0,
+            YuvMatrix::Bt709 => 1,
+            YuvMatrix::Bt2020 => 2,
+        }
+    }
+}
+
+impl From<ffmpeg_next::color::Space> for ColorSpace {
+    fn from(space: ffmpeg_next::color::Space) -> Self {
+        use ffmpeg_next::color::Space as S;
+        match space {
+            S::BT709 => ColorSpace::Bt709,
+            S::BT470BG | S::SMPTE170M | S::FCC => ColorSpace::Bt601,
+            S::BT2020NCL | S::BT2020CL => ColorSpace::Bt2020,
+            _ => ColorSpace::Unspecified,
+        }
+    }
+}
+
+impl From<ffmpeg_next::color::Primaries> for ColorPrimaries {
+    fn from(p: ffmpeg_next::color::Primaries) -> Self {
+        use ffmpeg_next::color::Primaries as P;
+        match p {
+            P::BT709 => ColorPrimaries::Bt709,
+            P::BT470BG | P::SMPTE170M => ColorPrimaries::Bt601,
+            P::BT2020 => ColorPrimaries::Bt2020,
+            P::Unspecified => ColorPrimaries::Unspecified,
+            _ => ColorPrimaries::Other,
+        }
+    }
+}
+
+impl From<ffmpeg_next::color::Range> for ColorRange {
+    fn from(r: ffmpeg_next::color::Range) -> Self {
+        match r {
+            ffmpeg_next::color::Range::MPEG => ColorRange::Limited,
+            ffmpeg_next::color::Range::JPEG => ColorRange::Full,
+            _ => ColorRange::Unspecified,
+        }
+    }
+}
+
 /// 解码后的视频帧
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
@@ -157,6 +244,12 @@ pub struct VideoFrame {
     pub height: u32,
     /// 像素格式
     pub format: PixelFormat,
+    /// Y′CbCr 矩阵系数（未标注为 `Unspecified`）
+    pub color_space: ColorSpace,
+    /// 色域 primaries（未标注为 `Unspecified`）
+    pub color_primaries: ColorPrimaries,
+    /// 采样量程（未标注为 `Unspecified`）
+    pub color_range: ColorRange,
     /// 平面数据（Y, U, V 或 Y, UV）
     pub planes: Vec<PlaneData>,
 }
@@ -269,6 +362,36 @@ impl VideoFrame {
     /// 以秒表示的 PTS；无时间戳或时间基无效时为 `None`
     pub fn pts_secs(&self) -> Option<f64> {
         self.pts.and_then(|t| ticks_to_seconds(t, self.time_base))
+    }
+
+    /// 渲染用矩阵：帧上的 matrix → primaries → 分辨率，逐层回退
+    ///
+    /// 码流经常只写 primaries 不写 matrix，或两者都不写（老 DVD、多数 MP4）。
+    /// 这时按 ITU-R BT.1358 的惯例：高清用 BT.709，标清用 BT.601。
+    pub fn yuv_matrix(&self) -> YuvMatrix {
+        match self.color_space {
+            ColorSpace::Bt601 => YuvMatrix::Bt601,
+            ColorSpace::Bt709 => YuvMatrix::Bt709,
+            ColorSpace::Bt2020 => YuvMatrix::Bt2020,
+            ColorSpace::Unspecified => match self.color_primaries {
+                ColorPrimaries::Bt601 => YuvMatrix::Bt601,
+                ColorPrimaries::Bt709 => YuvMatrix::Bt709,
+                ColorPrimaries::Bt2020 => YuvMatrix::Bt2020,
+                ColorPrimaries::Unspecified | ColorPrimaries::Other => {
+                    if self.width >= 1280 || self.height >= 720 {
+                        YuvMatrix::Bt709
+                    } else {
+                        YuvMatrix::Bt601
+                    }
+                }
+            },
+        }
+    }
+
+    /// 是否 full range（0..255）。YUV 内容未标注时按 limited（16..235），
+    /// 与 FFmpeg / ITU-R 的默认一致
+    pub fn is_full_range(&self) -> bool {
+        matches!(self.color_range, ColorRange::Full)
     }
 }
 
@@ -408,6 +531,9 @@ mod tests {
             width: 1920,
             height: 1080,
             format: PixelFormat::Yuv420p,
+            color_space: ColorSpace::Bt709,
+            color_primaries: ColorPrimaries::Bt709,
+            color_range: ColorRange::Limited,
             planes: vec![
                 PlaneData {
                     data: vec![0; 1920 * 1080],
@@ -468,6 +594,9 @@ mod tests {
             width: 320,
             height: 240,
             format: PixelFormat::Yuv420p,
+            color_space: ColorSpace::Unspecified,
+            color_primaries: ColorPrimaries::Unspecified,
+            color_range: ColorRange::Unspecified,
             planes: vec![],
         };
         assert_eq!(frame.pts, None);
@@ -494,6 +623,9 @@ mod tests {
             width: 320,
             height: 240,
             format: PixelFormat::Yuv420p,
+            color_space: ColorSpace::Unspecified,
+            color_primaries: ColorPrimaries::Unspecified,
+            color_range: ColorRange::Unspecified,
             planes: vec![],
         };
         assert_eq!(frame.pts_secs(), Some(0.0));
@@ -546,5 +678,135 @@ mod tests {
     fn test_unknown_codec_fallback() {
         let id = VideoCodecId::from(ffmpeg_next::codec::Id::MPEG4);
         assert_eq!(id, VideoCodecId::Unknown);
+    }
+
+    fn frame_with(
+        width: u32,
+        height: u32,
+        space: ColorSpace,
+        primaries: ColorPrimaries,
+        range: ColorRange,
+    ) -> VideoFrame {
+        VideoFrame {
+            pts: None,
+            time_base: time_base(1, 90000),
+            width,
+            height,
+            format: PixelFormat::Yuv420p,
+            color_space: space,
+            color_primaries: primaries,
+            color_range: range,
+            planes: vec![],
+        }
+    }
+
+    /// 帧上写了 matrix 就直接用，不被 primaries 或分辨率覆盖
+    #[test]
+    fn yuv_matrix_prefers_frame_matrix() {
+        let f = frame_with(
+            1920,
+            1080,
+            ColorSpace::Bt601,
+            ColorPrimaries::Bt709,
+            ColorRange::Limited,
+        );
+        assert_eq!(f.yuv_matrix(), YuvMatrix::Bt601);
+    }
+
+    /// 缺 matrix 时按 primaries 回退（HD 流常只写 primaries）
+    #[test]
+    fn yuv_matrix_falls_back_to_primaries() {
+        let f = frame_with(
+            640,
+            360,
+            ColorSpace::Unspecified,
+            ColorPrimaries::Bt709,
+            ColorRange::Unspecified,
+        );
+        assert_eq!(f.yuv_matrix(), YuvMatrix::Bt709);
+
+        let f = frame_with(
+            1920,
+            1080,
+            ColorSpace::Unspecified,
+            ColorPrimaries::Bt2020,
+            ColorRange::Unspecified,
+        );
+        assert_eq!(f.yuv_matrix(), YuvMatrix::Bt2020);
+    }
+
+    /// matrix 与 primaries 都没写时用分辨率启发式：高清 709、标清 601
+    #[test]
+    fn yuv_matrix_falls_back_to_resolution() {
+        let hd = frame_with(
+            1280,
+            720,
+            ColorSpace::Unspecified,
+            ColorPrimaries::Unspecified,
+            ColorRange::Unspecified,
+        );
+        assert_eq!(hd.yuv_matrix(), YuvMatrix::Bt709);
+
+        let sd = frame_with(
+            640,
+            480,
+            ColorSpace::Unspecified,
+            ColorPrimaries::Unspecified,
+            ColorRange::Unspecified,
+        );
+        assert_eq!(sd.yuv_matrix(), YuvMatrix::Bt601);
+    }
+
+    /// 未标注量程按 limited（与 FFmpeg / ITU-R 默认一致），只有明确标 JPEG 才是 full
+    #[test]
+    fn full_range_only_when_marked() {
+        for range in [ColorRange::Unspecified, ColorRange::Limited] {
+            let f = frame_with(640, 480, ColorSpace::Bt601, ColorPrimaries::Bt601, range);
+            assert!(!f.is_full_range(), "{range:?} 应按 limited 解释");
+        }
+        let f = frame_with(
+            640,
+            480,
+            ColorSpace::Bt601,
+            ColorPrimaries::Bt601,
+            ColorRange::Full,
+        );
+        assert!(f.is_full_range());
+    }
+
+    /// FFmpeg 色彩枚举到内部枚举的映射：未覆盖的一律 Unspecified，交给回退链
+    #[test]
+    fn ffmpeg_color_enums_map_to_internal() {
+        use ffmpeg_next::color::{Primaries as FP, Range as FR, Space as FS};
+        assert_eq!(ColorSpace::from(FS::BT709), ColorSpace::Bt709);
+        assert_eq!(ColorSpace::from(FS::SMPTE170M), ColorSpace::Bt601);
+        assert_eq!(ColorSpace::from(FS::BT470BG), ColorSpace::Bt601);
+        assert_eq!(ColorSpace::from(FS::BT2020NCL), ColorSpace::Bt2020);
+        assert_eq!(ColorSpace::from(FS::BT2020CL), ColorSpace::Bt2020);
+        assert_eq!(ColorSpace::from(FS::SMPTE240M), ColorSpace::Unspecified);
+        assert_eq!(ColorSpace::from(FS::YCGCO), ColorSpace::Unspecified);
+
+        assert_eq!(
+            ColorPrimaries::from(FP::BT470BG),
+            ColorPrimaries::Bt601,
+            "PAL primaries 属 BT.601 系"
+        );
+        assert_eq!(ColorPrimaries::from(FP::SMPTE432), ColorPrimaries::Other);
+        assert_eq!(
+            ColorPrimaries::from(FP::Unspecified),
+            ColorPrimaries::Unspecified
+        );
+
+        assert_eq!(ColorRange::from(FR::MPEG), ColorRange::Limited);
+        assert_eq!(ColorRange::from(FR::JPEG), ColorRange::Full);
+        assert_eq!(ColorRange::from(FR::Unspecified), ColorRange::Unspecified);
+    }
+
+    /// shader_index 是与 WGSL `ColorParams.matrix` 的约定，取值不得改动
+    #[test]
+    fn shader_index_matches_wgsl_contract() {
+        assert_eq!(YuvMatrix::Bt601.shader_index(), 0);
+        assert_eq!(YuvMatrix::Bt709.shader_index(), 1);
+        assert_eq!(YuvMatrix::Bt2020.shader_index(), 2);
     }
 }

@@ -19,6 +19,8 @@ pub enum Command {
     Seek { target: f64, mode: SeekMode },
     /// 设置音量 (0-100)
     SetVolume { volume: u8 },
+    /// 静音开关
+    SetMute { muted: bool },
     /// 加载字幕文件（SRT/ASS/SSA）
     LoadSubtitle { path: String },
     /// 切换字幕显示/隐藏
@@ -57,6 +59,13 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let cmd2: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(cmd2, Command::LoadFile { url } if url == "/path/to/test.mp4"));
+    }
+
+    #[test]
+    fn roundtrip_set_mute() {
+        let json = serde_json::to_string(&Command::SetMute { muted: true }).unwrap();
+        let cmd: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(cmd, Command::SetMute { muted: true }));
     }
 
     #[test]

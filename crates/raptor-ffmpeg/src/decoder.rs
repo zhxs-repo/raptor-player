@@ -10,6 +10,10 @@ pub trait VideoDecoder: Send {
     /// 接收解码帧
     fn receive_frame(&mut self) -> Result<Option<VideoFrame>>;
 
+    /// 结束流：送入空包让解码器进入 drain 模式，之后 `receive_frame` 才能吐出
+    /// 内部滞留的尾部帧（B 帧重排缓冲）
+    fn send_eof(&mut self) -> Result<()>;
+
     /// 刷新解码器（seek 后调用）
     fn flush(&mut self);
 }
@@ -21,6 +25,10 @@ pub trait AudioDecoder: Send {
 
     /// 接收解码帧
     fn receive_frame(&mut self) -> Result<Option<AudioFrame>>;
+
+    /// 结束流：送入空包让解码器进入 drain 模式。AAC 等解码器会压着最后
+    /// 1~2 帧（约 1024 采样），不 drain 就取不到
+    fn send_eof(&mut self) -> Result<()>;
 
     /// 刷新解码器
     fn flush(&mut self);
@@ -73,6 +81,20 @@ impl Default for FfmpegVideoDecoder {
     }
 }
 
+impl FfmpegVideoDecoder {
+    /// 解码器上下文上的色彩元数据 — 帧未标注时的回退来源
+    fn context_color(&self) -> (ColorSpace, ColorPrimaries, ColorRange) {
+        match self.decoder.as_ref() {
+            Some(d) => (
+                ColorSpace::from(d.color_space()),
+                ColorPrimaries::from(d.color_primaries()),
+                ColorRange::from(d.color_range()),
+            ),
+            None => Default::default(),
+        }
+    }
+}
+
 impl VideoDecoder for FfmpegVideoDecoder {
     fn submit_packet(&mut self, packet: &Packet) -> Result<()> {
         let decoder = self
@@ -92,6 +114,7 @@ impl VideoDecoder for FfmpegVideoDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Option<VideoFrame>> {
+        let (ctx_space, ctx_primaries, ctx_range) = self.context_color();
         let decoder = self
             .decoder
             .as_mut()
@@ -118,6 +141,20 @@ impl VideoDecoder for FfmpegVideoDecoder {
                 // 视频解码帧 PTS 是输入 Packet PTS 的透传，时间基同为 pkt_timebase；
                 // 无时间戳（NOPTS）时保持 None，不伪装成 0
                 let pts = frame.pts();
+                // 色彩元数据：帧上没写就退回解码器上下文（H.264/HEVC 的 SPS VUI
+                // 解析结果通常只落在 ctx 上，帧未必继承）
+                let color_space = match ColorSpace::from(frame.color_space()) {
+                    ColorSpace::Unspecified => ctx_space,
+                    s => s,
+                };
+                let color_primaries = match ColorPrimaries::from(frame.color_primaries()) {
+                    ColorPrimaries::Unspecified => ctx_primaries,
+                    p => p,
+                };
+                let color_range = match ColorRange::from(frame.color_range()) {
+                    ColorRange::Unspecified => ctx_range,
+                    r => r,
+                };
 
                 Ok(Some(VideoFrame {
                     pts,
@@ -125,12 +162,26 @@ impl VideoDecoder for FfmpegVideoDecoder {
                     width,
                     height,
                     format: self.pixel_format,
+                    color_space,
+                    color_primaries,
+                    color_range,
                     planes,
                 }))
             }
             Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(RaptorError::Decode(format!("receive_frame: {e}"))),
         }
+    }
+
+    fn send_eof(&mut self) -> Result<()> {
+        let decoder = self
+            .decoder
+            .as_mut()
+            .ok_or_else(|| RaptorError::InvalidState("video decoder not configured".into()))?;
+        decoder
+            .send_eof()
+            .map_err(|e| RaptorError::Decode(format!("send_eof: {e}")))?;
+        Ok(())
     }
 
     fn flush(&mut self) {
@@ -188,11 +239,14 @@ impl FfmpegAudioDecoder {
     }
 
     /// 解码音频帧的时间基：FFmpeg 音频解码器以采样为单位输出 PTS
-    fn frame_timebase(&self) -> ffmpeg_next::Rational {
-        if self.sample_rate > 0 {
-            ffmpeg_next::Rational::new(1, self.sample_rate as i32)
+    fn frame_timebase(
+        sample_rate: u32,
+        pkt_timebase: ffmpeg_next::Rational,
+    ) -> ffmpeg_next::Rational {
+        if sample_rate > 0 {
+            ffmpeg_next::Rational::new(1, sample_rate as i32)
         } else {
-            self.pkt_timebase
+            pkt_timebase
         }
     }
 }
@@ -231,13 +285,23 @@ impl AudioDecoder for FfmpegAudioDecoder {
             Ok(()) => {
                 // 帧 PTS 单位是 1/sample_rate（不是 Packet 时间基），无时间戳保持 None
                 let pts = frame.pts();
-                let time_base = self.frame_timebase();
-                let samples = extract_audio_samples(&frame);
+                // AAC 等解码器输出的 AVFrame 可能不填 ch_layout / sample_rate，
+                // 此时必须以解码器上下文为准，否则声道数算成 0、整帧采样被当成空
+                let channels = match frame.channels() as usize {
+                    0 => self.channels as usize,
+                    n => n,
+                };
+                let sample_rate = match frame.rate() {
+                    0 => self.sample_rate,
+                    r => r,
+                };
+                let time_base = Self::frame_timebase(sample_rate, self.pkt_timebase);
+                let samples = extract_audio_samples(&frame, channels);
                 Ok(Some(AudioFrame {
                     pts,
                     time_base,
-                    sample_rate: self.sample_rate,
-                    channels: self.channels,
+                    sample_rate,
+                    channels: channels as u32,
                     format: self.sample_format,
                     samples,
                 }))
@@ -245,6 +309,17 @@ impl AudioDecoder for FfmpegAudioDecoder {
             Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(RaptorError::Decode(format!("receive_frame: {e}"))),
         }
+    }
+
+    fn send_eof(&mut self) -> Result<()> {
+        let decoder = self
+            .decoder
+            .as_mut()
+            .ok_or_else(|| RaptorError::InvalidState("audio decoder not configured".into()))?;
+        decoder
+            .send_eof()
+            .map_err(|e| RaptorError::Decode(format!("send_eof: {e}")))?;
+        Ok(())
     }
 
     fn flush(&mut self) {
@@ -312,29 +387,65 @@ fn is_eagain(err: &ffmpeg_next::Error) -> bool {
 
 /// 从 FFmpeg 音频帧提取 f32 采样
 ///
-/// 处理 planar（每声道独立 buffer）和 packed（声道交错在 data(0)）两种布局。
-/// 支持 F32/I16/I32/U8/F64 格式，统一归一化到 [-1.0, 1.0] f32 范围。
-fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
-    let channels = frame.channels() as usize;
-    let samples = frame.samples();
-    let format = frame.format();
+/// `ctx_channels`：解码器上下文的声道数。AAC 等解码器输出的 AVFrame 不填
+/// `ch_layout`，只按帧上的字段算声道会得到 0，整帧采样就被当成空；帧的安全
+/// 访问器（`planes()` / `data()`）同样依赖 `ch_layout`，因此直接读取
+/// `AVFrame` 的 `data[]` / `linesize[]`。
+fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio, ctx_channels: usize) -> Vec<f32> {
+    let channels = match frame.channels() as usize {
+        0 => ctx_channels.max(1),
+        n => n,
+    };
+    unsafe {
+        let p = frame.as_ptr();
+        extract_from_planes(
+            &(*p).data,
+            &(*p).linesize,
+            frame.format(),
+            frame.samples(),
+            channels,
+        )
+    }
+}
 
-    let is_planar = matches!(
-        format,
-        ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar)
-            | ffmpeg_next::format::Sample::F64(ffmpeg_next::format::sample::Type::Planar)
-            | ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Planar)
-            | ffmpeg_next::format::Sample::I32(ffmpeg_next::format::sample::Type::Planar)
-            | ffmpeg_next::format::Sample::U8(ffmpeg_next::format::sample::Type::Planar)
-    );
+/// 从 `AVFrame` 的数据平面提取 f32 采样
+///
+/// 处理 planar（每声道独立 buffer）和 packed（声道交错在 data[0]）两种布局。
+/// 支持 F32/I16/I32/U8/F64 格式，统一归一化到 [-1.0, 1.0] f32 范围。
+///
+/// # Safety
+/// `plane_ptrs` / `linesize` 必须是某个有效 `AVFrame` 的 8 项数据平面与行宽。
+unsafe fn extract_from_planes(
+    plane_ptrs: &[*mut u8; 8],
+    linesize: &[i32; 8],
+    format: ffmpeg_next::format::Sample,
+    samples: usize,
+    channels: usize,
+) -> Vec<f32> {
+    let channels = channels.max(1);
+    let is_planar = format.is_planar();
+    let plane_bytes = if is_planar {
+        samples * format.bytes()
+    } else {
+        samples * channels * format.bytes()
+    };
+    let plane_data = |index: usize| -> &[u8] {
+        match plane_ptrs.get(index).copied() {
+            Some(ptr) if !ptr.is_null() => {
+                let line = linesize.get(index).copied().unwrap_or(0).max(0) as usize;
+                std::slice::from_raw_parts(ptr as *const u8, plane_bytes.min(line))
+            }
+            _ => &[],
+        }
+    };
 
     let mut output = Vec::with_capacity(samples * channels);
 
     if is_planar {
         // Planar: 每个声道有独立的 buffer，逐声道逐采样交错输出
+        let planes: Vec<&[u8]> = (0..channels).map(plane_data).collect();
         for s in 0..samples {
-            for c in 0..channels {
-                let data = frame.data(c);
+            for data in planes.iter() {
                 let sample = match format {
                     ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar) => {
                         let offset = s * 4;
@@ -401,7 +512,7 @@ fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
         }
     } else {
         // Packed: 所有声道交错存储在 data(0)
-        let data = frame.data(0);
+        let data = plane_data(0);
         let total = samples * channels;
         match format {
             ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed) => {
@@ -495,6 +606,32 @@ fn extract_audio_samples(frame: &ffmpeg_next::frame::Audio) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 声道数缺失的解码帧（AAC 不填 ch_layout）必须按上下文声道数提取，
+    /// 否则整帧采样被当成空，播放端只有静音
+    #[test]
+    fn extract_from_planes_ignores_frame_channel_layout() {
+        use ffmpeg_next::format::sample::Type;
+        use ffmpeg_next::format::Sample;
+
+        let left: [f32; 2] = [0.5, -0.25];
+        let right: [f32; 2] = [0.125, -0.5];
+        let mut plane_ptrs: [*mut u8; 8] = [std::ptr::null_mut(); 8];
+        let mut linesize: [i32; 8] = [0; 8];
+        let plane_bytes = (left.len() * std::mem::size_of::<f32>()) as i32;
+        plane_ptrs[0] = left.as_ptr() as *mut u8;
+        linesize[0] = plane_bytes;
+
+        let mono =
+            unsafe { extract_from_planes(&plane_ptrs, &linesize, Sample::F32(Type::Planar), 2, 1) };
+        assert_eq!(mono, vec![0.5, -0.25]);
+
+        plane_ptrs[1] = right.as_ptr() as *mut u8;
+        linesize[1] = plane_bytes;
+        let stereo =
+            unsafe { extract_from_planes(&plane_ptrs, &linesize, Sample::F32(Type::Planar), 2, 2) };
+        assert_eq!(stereo, vec![0.5, 0.125, -0.25, -0.5], "planar 应交错输出");
+    }
 
     #[test]
     fn test_video_decoder_new() {

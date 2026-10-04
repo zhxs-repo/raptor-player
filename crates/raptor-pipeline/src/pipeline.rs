@@ -37,9 +37,15 @@ pub struct Pipeline {
     pub position_us: Arc<AtomicU64>,
     pub duration_us: Arc<AtomicU64>,
     pub demux_complete: Arc<AtomicBool>,
+    /// demux 读出的包总数 — 看门狗的"上游还在动"心跳
+    ///
+    /// 解码线程只看自己收不到数据，分不清是"这条流恰好没数据了"还是"上游
+    /// read_packet 卡死了"。计数不变且自己也无进展才算真卡死。
+    pub demux_progress: Arc<AtomicU64>,
     pub shutdown: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
     pub volume: Arc<AtomicU32>,
+    pub muted: Arc<AtomicBool>,
     pub event_tx: Sender<RaptorEvent>,
     /// 渲染器命令发送端（FFI 层 → render_loop，用于 Surface 管理）
     pub renderer_cmd_tx: Option<crossbeam_channel::Sender<RendererCmd>>,
@@ -48,16 +54,23 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(event_tx: Sender<RaptorEvent>) -> Self {
+        let seek_generation = Arc::new(AtomicU64::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
+        let avsync = Arc::new(AVSync::new());
+        // 主时钟门控要实时观察播放状态与 seek generation
+        avsync.set_clock_context(paused.clone(), seek_generation.clone());
         Self {
-            avsync: Arc::new(AVSync::new()),
+            avsync,
             seek_request: Arc::new(Mutex::new(None)),
-            seek_generation: Arc::new(AtomicU64::new(0)),
+            seek_generation,
             position_us: Arc::new(AtomicU64::new(0)),
             duration_us: Arc::new(AtomicU64::new(0)),
             demux_complete: Arc::new(AtomicBool::new(false)),
+            demux_progress: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
+            paused,
             volume: Arc::new(AtomicU32::new(100)),
+            muted: Arc::new(AtomicBool::new(false)),
             event_tx,
             renderer_cmd_tx: None,
             thread_handles: Arc::new(Mutex::new(Vec::new())),
@@ -103,6 +116,25 @@ impl Pipeline {
         self.volume.load(Ordering::Relaxed)
     }
 
+    /// 设置静音开关（不影响已存的音量值，取消静音即回到原音量）
+    pub fn set_mute(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// 当前是否静音
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// 实际送给他音频输出的增益：静音时为 0，否则为音量的 0.0-1.0 形式
+    pub fn effective_volume(&self) -> f32 {
+        if self.is_muted() {
+            0.0
+        } else {
+            self.get_volume() as f32 / 100.0
+        }
+    }
+
     /// 启动 pipeline — 创建 demux/decode/render/audio/subtitle 线程
     ///
     /// 接受已打开的 demuxer，避免重复打开文件。
@@ -132,8 +164,12 @@ impl Pipeline {
         // 重置状态
         self.shutdown.store(false, Ordering::Release);
         self.demux_complete.store(false, Ordering::Release);
+        self.demux_progress.store(0, Ordering::Release);
         self.seek_generation.store(0, Ordering::Release);
         self.position_us.store(0, Ordering::Release);
+        // 主时钟按新文件从零开始：AVSync 与本 pipeline 同生命周期，但 start 可能
+        // 被同一实例再次调用，不重置就会拿着上一个文件的锚点与已接受的音频读数
+        self.avsync.reset(0.0);
 
         let info = demuxer
             .info()
@@ -172,9 +208,11 @@ impl Pipeline {
             position_us: self.position_us.clone(),
             duration_us: self.duration_us.clone(),
             demux_complete: self.demux_complete.clone(),
+            demux_progress: self.demux_progress.clone(),
             shutdown: self.shutdown.clone(),
             paused: self.paused.clone(),
             volume: self.volume.clone(),
+            muted: self.muted.clone(),
             event_tx: self.event_tx.clone(),
             renderer_cmd_tx: None, // 工作线程不需要，仅 FFI 层使用
             thread_handles: self.thread_handles.clone(),
@@ -182,13 +220,14 @@ impl Pipeline {
 
         // 1. Demux 线程
         let p = pipeline.clone();
+        let reporter = pipeline.clone();
         let h = std::thread::Builder::new()
             .name("raptor-demux".into())
             .spawn(move || {
                 Self::run_thread(|| {
                     demux_loop(p, demuxer, video_pkt_tx, audio_pkt_tx, subtitle_pkt_tx)
                 })
-                .unwrap_or_else(|e| tracing::error!("demux thread error: {}", e));
+                .unwrap_or_else(|e| reporter.report_failure("demux thread", &e));
             })
             .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn demux: {e}")))?;
         self.thread_handles.lock().push(h);
@@ -201,13 +240,14 @@ impl Pipeline {
                 Box::new(FfmpegVideoDecoder::new())
             };
             let p = pipeline.clone();
+            let reporter = pipeline.clone();
             let h = std::thread::Builder::new()
                 .name("raptor-vdecode".into())
                 .spawn(move || {
                     Self::run_thread(|| {
                         video_decode_loop(p, video_decoder, video_pkt_rx, video_frame_tx)
                     })
-                    .unwrap_or_else(|e| tracing::error!("video decode thread error: {}", e));
+                    .unwrap_or_else(|e| reporter.report_failure("video decode thread", &e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn vdecode: {e}")))?;
             self.thread_handles.lock().push(h);
@@ -221,13 +261,14 @@ impl Pipeline {
                 Box::new(FfmpegAudioDecoder::new())
             };
             let p = pipeline.clone();
+            let reporter = pipeline.clone();
             let h = std::thread::Builder::new()
                 .name("raptor-adecode".into())
                 .spawn(move || {
                     Self::run_thread(|| {
                         audio_decode_loop(p, audio_decoder, audio_pkt_rx, audio_frame_tx)
                     })
-                    .unwrap_or_else(|e| tracing::error!("audio decode thread error: {}", e));
+                    .unwrap_or_else(|e| reporter.report_failure("audio decode thread", &e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn adecode: {e}")))?;
             self.thread_handles.lock().push(h);
@@ -236,6 +277,7 @@ impl Pipeline {
         // 4. Render 线程
         {
             let p = pipeline.clone();
+            let reporter = pipeline.clone();
             let renderer = renderer.clone();
             let event_tx = self.event_tx.clone();
             let vi = video_info.clone();
@@ -256,7 +298,7 @@ impl Pipeline {
                             renderer_cmd_rx,
                         )
                     })
-                    .unwrap_or_else(|e| tracing::error!("render thread error: {}", e));
+                    .unwrap_or_else(|e| reporter.report_failure("render thread", &e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn render: {e}")))?;
             self.thread_handles.lock().push(h);
@@ -272,13 +314,16 @@ impl Pipeline {
                 audio_output.init(info.sample_rate, info.channels)?;
             }
             tracing::info!("Pipeline::start: audio output initialized, spawning thread...");
+            // 音频输出即主时钟来源；无音频轨时时钟未 ready，AVSync 自动回退挂钟
+            self.avsync.set_audio_clock(audio_output.clock());
             let p = pipeline.clone();
+            let reporter = pipeline.clone();
             let h = std::thread::Builder::new()
                 .name("raptor-audio".into())
                 .spawn(move || {
                     tracing::info!("audio thread closure entered");
                     Self::run_thread(|| audio_output_loop(p, audio_output, audio_frame_rx))
-                        .unwrap_or_else(|e| tracing::error!("audio thread error: {}", e));
+                        .unwrap_or_else(|e| reporter.report_failure("audio output thread", &e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn audio: {e}")))?;
             self.thread_handles.lock().push(h);
@@ -296,13 +341,14 @@ impl Pipeline {
                 )
             });
             let p = pipeline.clone();
+            let reporter = pipeline.clone();
             let h = std::thread::Builder::new()
                 .name("raptor-subtitle".into())
                 .spawn(move || {
                     Self::run_thread(|| {
                         subtitle_decode_loop(p, subtitle_pkt_rx, sub_engine, is_text_subtitle)
                     })
-                    .unwrap_or_else(|e| tracing::error!("subtitle thread error: {}", e));
+                    .unwrap_or_else(|e| reporter.report_failure("subtitle thread", &e));
                 })
                 .map_err(|e| raptor_core::RaptorError::Internal(format!("spawn subtitle: {e}")))?;
             self.thread_handles.lock().push(h);
@@ -363,6 +409,31 @@ impl Pipeline {
             }
         }
     }
+
+    /// 工作线程失败上报
+    ///
+    /// 只写日志的话，前端看到的状态还停在 `Playing`，画面却早已静止；错误必须
+    /// 作为事件出去，GUI 才能显示错误界面并把状态收敛到 `Error`。
+    fn report_failure(&self, stage: &str, e: &raptor_core::RaptorError) {
+        tracing::error!("{stage} error: {e}");
+        let _ = self.event_tx.send(RaptorEvent::Error {
+            code: e.error_code() as i32,
+            message: format!("{stage}: {e}"),
+        });
+    }
+
+    /// 看门狗上报：某级流水线在较长时间内毫无进展
+    ///
+    /// 卡死在 GUI 上的表现只是"画面静止"：线程还活着、状态还是 `Playing`、命令
+    /// 也都返回成功。停滞必须自己成为 `RaptorEvent::Error`，否则前端只能永远等下去。
+    pub(crate) fn report_stall(&self, stage: &str, stalled: std::time::Duration) {
+        let message = format!("{stage}: stalled for {:.1}s", stalled.as_secs_f64());
+        tracing::error!("watchdog: {message}");
+        let _ = self.event_tx.send(RaptorEvent::Error {
+            code: raptor_core::ErrorCode::PipelineError as i32,
+            message,
+        });
+    }
 }
 
 impl Drop for Pipeline {
@@ -381,6 +452,41 @@ mod tests {
         Pipeline::new(tx)
     }
 
+    /// 线程失败必须成为事件：日志只给开发者，前端需要能看见
+    #[test]
+    fn report_failure_emits_error_event() {
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let p = Pipeline::new(tx);
+        p.report_failure(
+            "video decode thread",
+            &raptor_core::RaptorError::Decode("boom".into()),
+        );
+        match rx.recv().expect("必须发出一个事件") {
+            RaptorEvent::Error { code, message } => {
+                assert_eq!(code, raptor_core::ErrorCode::DecodeError as i32);
+                assert!(message.contains("video decode thread"), "{message}");
+                assert!(message.contains("boom"), "{message}");
+            }
+            other => panic!("期望 Error 事件，got {other:?}"),
+        }
+    }
+
+    /// 看门狗上报：停滞同样要成为可见的错误事件
+    #[test]
+    fn report_stall_emits_pipeline_error_event() {
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let p = Pipeline::new(tx);
+        p.report_stall("video decode", std::time::Duration::from_millis(2_100));
+        match rx.recv().expect("必须发出一个事件") {
+            RaptorEvent::Error { code, message } => {
+                assert_eq!(code, raptor_core::ErrorCode::PipelineError as i32);
+                assert!(message.contains("video decode"), "{message}");
+                assert!(message.contains("2.1"), "{message}");
+            }
+            other => panic!("期望 Error 事件，got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_new_pipeline_defaults() {
         let p = make_pipeline();
@@ -388,6 +494,22 @@ mod tests {
         assert!((p.duration_secs() - 0.0).abs() < f64::EPSILON);
         assert!(!p.is_paused());
         assert_eq!(p.get_volume(), 100);
+        assert!(!p.is_muted());
+        assert!((p.effective_volume() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_set_mute_keeps_volume() {
+        let p = make_pipeline();
+        p.set_volume(60);
+        p.set_mute(true);
+        assert!(p.is_muted());
+        assert_eq!(p.get_volume(), 60);
+        assert_eq!(p.effective_volume(), 0.0);
+
+        p.set_mute(false);
+        assert!(!p.is_muted());
+        assert!((p.effective_volume() - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]

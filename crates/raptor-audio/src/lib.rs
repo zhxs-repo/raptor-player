@@ -1,8 +1,10 @@
+pub mod clock;
 pub mod cpal_output;
 
 #[cfg(target_os = "android")]
 pub mod aaudio_output;
 
+pub use clock::{AudioClock, AudioClockObservation};
 pub use cpal_output::{AudioOutput, CpalOutput};
 
 #[cfg(target_os = "android")]

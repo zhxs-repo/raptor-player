@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::state::InvalidStateTransition;
+
 /// Raptor 错误码 — C ABI 返回值（负数 = 错误）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -54,13 +56,28 @@ pub enum RaptorError {
     Pipeline(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// 状态机不接受这次落点（例如 Error 态直接 Play）
+    #[error("invalid state transition: {from} -> {to}")]
+    InvalidStateTransition {
+        from: crate::PlayerState,
+        to: crate::PlayerState,
+    },
+}
+
+impl From<InvalidStateTransition> for RaptorError {
+    fn from(e: InvalidStateTransition) -> Self {
+        Self::InvalidStateTransition {
+            from: e.from,
+            to: e.to,
+        }
+    }
 }
 
 impl RaptorError {
     pub fn error_code(&self) -> ErrorCode {
         match self {
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
-            Self::InvalidState(_) => ErrorCode::InvalidState,
+            Self::InvalidState(_) | Self::InvalidStateTransition { .. } => ErrorCode::InvalidState,
             Self::FileNotFound(_) => ErrorCode::FileNotFound,
             Self::Demux(_) => ErrorCode::DemuxError,
             Self::Decode(_) => ErrorCode::DecodeError,

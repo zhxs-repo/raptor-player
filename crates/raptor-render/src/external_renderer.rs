@@ -14,7 +14,7 @@
 use crate::clock::OverlayClock;
 use crate::overlay::OverlayStack;
 use crate::wgpu_renderer::SurfaceHandle;
-use crate::yuv_pipeline::{interleave_uv_planes, setup_yuv_pipeline};
+use crate::yuv_pipeline::{color_params_bytes, interleave_uv_planes, setup_yuv_pipeline};
 use raptor_core::Result;
 use raptor_ffmpeg::{PixelFormat, VideoFrame};
 use std::collections::VecDeque;
@@ -86,6 +86,8 @@ struct ExtRenderState {
     y_texture: wgpu::Texture,
     uv_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    /// 色彩参数 uniform（矩阵 + 量程），每个视频帧更新一次
+    color_params: wgpu::Buffer,
     video_width: u32,
     video_height: u32,
     last_frame: Option<VideoFrame>,
@@ -147,7 +149,7 @@ impl ExtRenderState {
         surface.configure(&device, &surface_config);
 
         // 使用 1x1 占位纹理初始化 pipeline（真正的视频尺寸在首帧时更新）
-        let (render_pipeline, bind_group, y_texture, uv_texture) =
+        let (render_pipeline, bind_group, y_texture, uv_texture, color_params) =
             setup_yuv_pipeline(&device, surface_format, 1, 1, "ext");
 
         let vsync_locked = surface_config.present_mode == wgpu::PresentMode::Fifo;
@@ -172,6 +174,7 @@ impl ExtRenderState {
             y_texture,
             uv_texture,
             bind_group,
+            color_params,
             video_width: 0,
             video_height: 0,
             last_frame: None,
@@ -299,7 +302,7 @@ impl ExtRenderState {
         if frame.width != self.video_width || frame.height != self.video_height {
             self.video_width = frame.width;
             self.video_height = frame.height;
-            let (pipeline, bg, yt, uvt) = setup_yuv_pipeline(
+            let (pipeline, bg, yt, uvt, cp) = setup_yuv_pipeline(
                 &self.device,
                 self.surface_format,
                 frame.width,
@@ -310,7 +313,12 @@ impl ExtRenderState {
             self.bind_group = bg;
             self.y_texture = yt;
             self.uv_texture = uvt;
+            self.color_params = cp;
         }
+
+        // 矩阵系数与量程写错是画质错误而不是抖动，所以每帧都按帧上的元数据更新
+        self.queue
+            .write_buffer(&self.color_params, 0, &color_params_bytes(frame));
 
         // 上传 Y 平面
         if let Some(y_plane) = frame.planes.first() {
@@ -1050,6 +1058,9 @@ mod tests {
             width: 320,
             height: 240,
             format: raptor_ffmpeg::PixelFormat::Nv12,
+            color_space: raptor_ffmpeg::ColorSpace::Unspecified,
+            color_primaries: raptor_ffmpeg::ColorPrimaries::Unspecified,
+            color_range: raptor_ffmpeg::ColorRange::Unspecified,
             planes: vec![],
             pts: Some(0),
             time_base: raptor_ffmpeg::time_base(1, 90000),

@@ -35,6 +35,11 @@ pub struct SubtitleState {
     pub current_text: String,
     /// 是否启用
     pub enabled: bool,
+    /// 事件源是否为用户显式加载的字幕文件
+    ///
+    /// 为 true 时忽略内嵌字幕轨的实时追加：多轨切换尚未实现，
+    /// 两个来源同时写入会叠着显示两套字幕。
+    pub external_source: bool,
 }
 
 /// 缓存的纹理
@@ -99,6 +104,7 @@ impl SubtitleEngine {
                 play_res: (0.0, 0.0),
                 current_text: String::new(),
                 enabled: true,
+                external_source: false,
             })),
             config,
             font_data: None,
@@ -180,6 +186,7 @@ impl SubtitleEngine {
             state.styles = HashMap::new();
             state.play_res = (0.0, 0.0);
         }
+        state.external_source = true;
         Ok(())
     }
 
@@ -190,6 +197,23 @@ impl SubtitleEngine {
         state.events = events;
         state.styles = HashMap::new();
         state.play_res = (0.0, 0.0);
+        state.external_source = false;
+    }
+
+    /// 追加字幕事件（不清空已有内容），供内嵌字幕边解码边注入使用
+    pub fn append_events(&self, events: Vec<SubtitleEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.external_source {
+            tracing::debug!("subtitle: 忽略内嵌轨追加（用户已加载外部字幕文件）");
+            return;
+        }
+        state.events.extend(events.iter().cloned());
+        state
+            .ass_events
+            .extend(events.into_iter().map(AssEvent::plain));
     }
 
     /// config 派生的默认样式（无 ASS 样式表时使用，行为与旧实现一致）
@@ -835,6 +859,42 @@ mod tests {
     }
 
     use crate::parser::AssParser;
+
+    /// 用户显式加载字幕文件后，内嵌轨的实时追加不得再混入同一事件表
+    #[test]
+    fn append_events_ignored_after_external_file_load() {
+        let dir = std::env::temp_dir().join(format!("raptor_sub_ext_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ext.ass");
+        std::fs::write(
+            &path,
+            "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n\n\
+             [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour\n\
+             Style: Default,Arial,60,&H00FFFFFF\n\n\
+             [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+             Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,外部字幕\n",
+        )
+        .unwrap();
+
+        let engine = SubtitleEngine::new(SubtitleConfig::default());
+        engine.load_from_file(path.to_str().unwrap()).unwrap();
+        let state = engine.shared_state();
+        let after_load = state.lock().events.len();
+
+        engine.append_events(vec![event(1.0, 2.0, "内嵌轨")]);
+        assert_eq!(
+            state.lock().events.len(),
+            after_load,
+            "外部字幕文件生效期间应忽略内嵌轨追加"
+        );
+
+        // 换回事件列表加载（如内嵌轨自身重新载入）则恢复追加能力
+        engine.load_events(vec![event(1.0, 2.0, "内嵌轨")]);
+        engine.append_events(vec![event(5.0, 6.0, "内嵌轨2")]);
+        assert_eq!(state.lock().events.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_plain_event_anchors_bottom_center() {
