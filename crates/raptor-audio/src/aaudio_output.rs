@@ -15,7 +15,7 @@ mod aaudio_sys {
     //! These are defined in `<aaudio/AAudio.h>` in the Android NDK.
     //! Link with `-laaudio`.
 
-    #![allow(non_camel_case_types, dead_code)]
+    #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
     use std::os::raw::c_void;
 
@@ -142,6 +142,8 @@ mod aaudio_sys {
         ) -> aaudio_result_t;
 
         pub fn AAudioStream_requestStart(stream: *mut AAudioStream) -> aaudio_result_t;
+
+        pub fn AAudioStream_requestPause(stream: *mut AAudioStream) -> aaudio_result_t;
 
         pub fn AAudioStream_requestStop(stream: *mut AAudioStream) -> aaudio_result_t;
 
@@ -388,6 +390,71 @@ impl AudioOutput for AaudioOutput {
 
     fn volume(&self) -> f32 {
         f32::from_bits(self.volume.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 本地 ring buffer 装得下这一帧（重采样后的设备采样数）吗
+    fn accepts(&self, frame: &AudioFrame) -> bool {
+        let channels = self.channels.max(1) as usize;
+        let src_frames = frame.samples.len() / channels;
+        let device_samples = if self.sample_rate > 0 && self.device_rate > self.sample_rate {
+            (src_frames as f64 * (self.device_rate as f64 / self.sample_rate as f64)).ceil()
+                as usize
+                * channels
+        } else {
+            src_frames * channels
+        };
+        self.buffer.lock().len() + device_samples <= MAX_BUFFER_SAMPLES
+    }
+
+    /// 冻结设备消费：不暂停的话缓冲里的旧采样会在"已暂停"期间继续放完
+    fn pause(&mut self) -> Result<()> {
+        if let Some(stream) = self.stream {
+            let result = unsafe { aaudio_sys::AAudioStream_requestPause(stream) };
+            if result != aaudio_sys::AAUDIO_OK {
+                return Err(RaptorError::Audio(format!(
+                    "AAudioStream_requestPause failed: {result}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        if let Some(stream) = self.stream {
+            let result = unsafe { aaudio_sys::AAudioStream_requestStart(stream) };
+            if result != aaudio_sys::AAUDIO_OK {
+                return Err(RaptorError::Audio(format!(
+                    "AAudioStream_requestStart failed: {result}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 丢弃未播采样（seek / flush 语义）
+    ///
+    /// AAudio 没有独立的 flush 入口：`requestStop` 会同步停流并丢弃设备
+    /// 内部队列里尚未播放的采样，随后 `requestStart` 复位供继续使用。
+    /// 本地 ring buffer 同样要清空——两层里存的都是旧位置的采样。
+    fn flush(&mut self) {
+        self.buffer.lock().clear();
+        if let Some(stream) = self.stream {
+            unsafe {
+                let stop = aaudio_sys::AAudioStream_requestStop(stream);
+                if stop != aaudio_sys::AAUDIO_OK {
+                    tracing::warn!("AaudioOutput: flush requestStop failed: {stop}");
+                }
+                let start = aaudio_sys::AAudioStream_requestStart(stream);
+                if start != aaudio_sys::AAUDIO_OK {
+                    tracing::warn!("AaudioOutput: flush requestStart failed: {start}");
+                }
+            }
+        }
+    }
+
+    /// EOF 排空判定：本地缓冲是否还有未写入设备的采样
+    fn has_pending_audio(&self) -> bool {
+        !self.buffer.lock().is_empty()
     }
 }
 

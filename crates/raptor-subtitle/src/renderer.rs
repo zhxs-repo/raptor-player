@@ -17,7 +17,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 单帧最多渲染的字幕条数（也等于 alpha uniform 的槽位数）
-const MAX_ITEMS: usize = 8;
+///
+/// Danmaku2ASS 风格的滚动字幕同屏常有 20~40 条事件，上限低于实际密度时，
+/// 溢出裁剪会把仍在屏上滚动的老字幕整条抽走（表现为"滚到左侧突然消失"）。
+/// 取 128 作为容量兜底，正常弹幕密度下不会触发裁剪。
+const MAX_ITEMS: usize = 128;
 /// uniform 槽位间隔（min_uniform_buffer_offset_alignment）
 const UNIFORM_SLOT: u64 = 256;
 
@@ -584,8 +588,14 @@ impl Overlay for SubtitleEngine {
             })
             .collect();
 
-        // layer 升序：高 layer 后绘制（压在上层）；stable sort 保持同层文件顺序
-        refs.sort_by_key(|e| e.layer);
+        // layer 升序：高 layer 后绘制（压在上层）。同层按开始时间倒序：
+        // 超出 MAX_ITEMS 时优先保留最新事件——最老的滚动字幕已接近出画，
+        // 丢弃它们比把新事件整个挤掉（等旧批滚完才上场、一上场就在终点）好得多。
+        refs.sort_by(|a, b| {
+            a.layer
+                .cmp(&b.layer)
+                .then(b.base.start_time.total_cmp(&a.base.start_time))
+        });
 
         let items: Vec<RenderItem> = refs
             .iter()
@@ -650,6 +660,11 @@ impl Overlay for SubtitleEngine {
 
         let items = std::mem::take(&mut self.active_items);
 
+        // 本帧用到的纹理 key 集合：缓存超限时只淘汰不再使用的条目，
+        // 避免整表清空导致高密度弹幕下每帧全量重新光栅化
+        let used_hashes: std::collections::HashSet<u64> =
+            items.iter().map(Self::item_hash).collect();
+
         let mut prepared: Vec<(u64, f32)> = Vec::with_capacity(items.len());
         for item in &items {
             let hash = Self::item_hash(item);
@@ -688,8 +703,8 @@ impl Overlay for SubtitleEngine {
                             depth_or_array_layers: 1,
                         },
                     );
-                    if self.texture_cache.len() > 64 {
-                        self.texture_cache.clear();
+                    if self.texture_cache.len() > 256 {
+                        self.texture_cache.retain(|k, _| used_hashes.contains(k));
                     }
                     self.texture_cache.insert(
                         hash,
@@ -1010,9 +1025,60 @@ Dialogue: 0,0:00:01.00,0:00:05.00,Big,,0,0,0,,styled
         let doc = ass(&src);
         let mut engine = engine_with_doc(doc);
         engine.update(2.0);
-        assert_eq!(engine.active_items.len(), MAX_ITEMS);
+        // 12 条低于上限，全部保留
+        assert_eq!(engine.active_items.len(), 12);
         // layer 升序绘制：首个 item 来自最低 layer（i % 3 == 0 → i=0）
         assert_eq!(engine.active_items[0].text, "line 0");
+    }
+
+    #[test]
+    fn test_overflow_keeps_newest_events() {
+        // 模拟 Danmaku2ASS 滚动弹幕：超出上限的事件错峰开始、同层、持续 8s
+        let n = MAX_ITEMS + 18;
+        let mut src = String::from(
+            "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+        );
+        for i in 0..n {
+            let start = i as f64 * 0.02;
+            src.push_str(&format!(
+                "Dialogue: 0,{:},{:},Default,,0,0,0,,{{\\move(2040,40,-120,40)}}dan {}\n",
+                fmt_s(start),
+                fmt_s(start + 8.0),
+                i
+            ));
+        }
+        let doc = ass(&src);
+        let mut engine = engine_with_doc(doc);
+        engine.update(3.0);
+        assert_eq!(engine.active_items.len(), MAX_ITEMS);
+        let texts: Vec<&str> = engine
+            .active_items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect();
+        // 保留的是最新的 MAX_ITEMS 条：最后一条在、最老的 d0 被丢弃
+        let last = format!("dan {}", n - 1);
+        assert!(texts.contains(&last.as_str()), "texts={texts:?}");
+        assert!(
+            !texts.contains(&"dan 0"),
+            "oldest must be dropped: {texts:?}"
+        );
+        // 最新一条刚上场，锚点应仍在移动起点（画布右侧）附近，而非终点
+        let newest = engine.active_items.iter().find(|i| i.text == last).unwrap();
+        assert!(
+            newest.anchor.0 > 1900.0,
+            "newest anchor should be near move start, got {:?}",
+            newest.anchor
+        );
+    }
+
+    fn fmt_s(secs: f64) -> String {
+        let total = secs.max(0.0);
+        let h = (total / 3600.0) as u32;
+        let m = ((total / 60.0) as u32) % 60;
+        let s = (total % 60.0) as u32;
+        let cs = ((total * 100.0) as u32) % 100;
+        format!("{h}:{m:02}:{s:02}.{cs:02}")
     }
 
     #[test]
