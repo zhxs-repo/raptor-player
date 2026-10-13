@@ -14,7 +14,16 @@ resolver = "2"
 [workspace.dependencies]
 # LTS locked
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "filter", "software-scaling", "software-resampling"] }
-wgpu = { version = "29", default-features = false, features = ["vulkan", "metal", "gles", "wgsl"] }
+# `std` and `parking_lot` were being dropped by default-features = false, which
+# left wgpu-core building in no_std mode -- fine for a Windows check, broken for
+# the Android Vulkan/GLES backends.
+#
+# No `dx12` on purpose: enabling it pulls in wgpu-hal's D3D12 suballocator, which
+# does not compile against the `windows` crate versions in the lockfile
+# (gpu-allocator 0.28 wants a newer windows-core than wgpu-hal 29.0.3 allows).
+# The Windows CLI player therefore has no GPU backend; enabling dx12 needs a
+# windows/gpu-allocator version bump first. Irrelevant for Android.
+wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "gles", "wgsl"] }
 cpal = "0.15"
 tokio = { version = "1", features = ["sync", "rt"] }
 crossbeam-channel = "0.5"
@@ -26,6 +35,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# android-native-activity is only needed by the desktop WgpuRenderer's winit
+# event loop; on Android the surface comes from Flutter via ExternalRenderer.
 winit = { version = "0.29", features = ["android-native-activity"] }
 pollster = "0.4"
 thiserror = "1"

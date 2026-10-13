@@ -2,12 +2,17 @@
 //!
 //! 从操作系统加载默认字体文件（TTF/OTF），供字幕和弹幕引擎光栅化文本使用。
 
+use raptor_render::font_util::{extract_ttc_preferred, CJK_SC_PREFER};
+
 /// 从系统加载默认字体的字节数据
 ///
 /// 搜索顺序：
 /// - Windows: Microsoft YaHei → Segoe UI → Arial
 /// - Linux: Noto Sans CJK → DejaVu Sans → Liberation Sans
 /// - macOS: PingFang SC → Hiragino Sans GB → Helvetica Neue
+/// - Android: Noto Sans CJK → Noto Sans SC → Droid Sans Fallback
+///
+/// TTC 会在这里就按 [`CJK_SC_PREFER`] 挑出简体中文 face，返回的是单字体数据。
 ///
 /// 返回 `None` 表示找不到任何可用字体。
 pub fn load_system_font() -> Option<Vec<u8>> {
@@ -15,7 +20,7 @@ pub fn load_system_font() -> Option<Vec<u8>> {
     for path in &candidates {
         if let Ok(data) = std::fs::read(path) {
             tracing::info!("font: loaded system font from {}", path);
-            return Some(data);
+            return Some(select_cjk_sc_face(data, path));
         }
     }
     tracing::warn!(
@@ -23,6 +28,24 @@ pub fn load_system_font() -> Option<Vec<u8>> {
         candidates.len()
     );
     None
+}
+
+/// 从 TTC 中选出简体中文 face，避免中文落到日文字形
+///
+/// 系统 CJK TTC 的 face #0 通常是 JP，而 `ab_glyph` 只认单个字体，
+/// 所以必须在交给引擎之前把正确的 face 抽出来。
+fn select_cjk_sc_face(data: Vec<u8>, path: &str) -> Vec<u8> {
+    match extract_ttc_preferred(&data, CJK_SC_PREFER) {
+        Some(face) => {
+            tracing::info!(
+                "font: {path} is a TTC, using face #{} '{}'",
+                face.index,
+                face.family
+            );
+            face.data
+        }
+        None => data,
+    }
 }
 
 /// 返回候选字体文件路径列表（按优先级排序）
@@ -54,6 +77,24 @@ fn font_candidates() -> Vec<String> {
         ]
     }
 
+    #[cfg(target_os = "android")]
+    {
+        // System fonts are readable without extra permissions (/system is
+        // world-readable), so no asset bundling or FFI font-handle plumbing is
+        // needed. NotoSansCJK-Regular.ttc is a 10-face collection whose face #0
+        // is the JP design — load_system_font() picks the SC face by name.
+        // Roboto is last on purpose: it has no CJK coverage, so it only helps
+        // on ROMs that ship no CJK font at all.
+        vec![
+            "/system/fonts/NotoSansCJK-Regular.ttc".into(),
+            "/system/fonts/NotoSansCJK-VF.ttc".into(),
+            "/system/fonts/NotoSansSC-Regular.otf".into(),
+            "/system/fonts/DroidSansFallback.ttf".into(),
+            "/system/fonts/NotoSansCJK-Regular.otf".into(),
+            "/system/fonts/Roboto-Regular.ttf".into(),
+        ]
+    }
+
     #[cfg(target_os = "macos")]
     {
         vec![
@@ -65,7 +106,12 @@ fn font_candidates() -> Vec<String> {
         ]
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )))]
     {
         Vec::new()
     }

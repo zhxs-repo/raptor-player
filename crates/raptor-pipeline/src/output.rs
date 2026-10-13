@@ -73,6 +73,9 @@ fn no_more_frames(
     } else {
         tracing::info!("render_loop: EOF (media clock reached duration)");
     }
+    // 置位"已播完"：此后所有工作线程都会退出，seek 请求没人消费。
+    // FFI 层靠它判断要不要重载文件才能响应"播完后往回拖"。
+    pipeline.ended.store(true, Ordering::Release);
     let _ = event_tx.send(RaptorEvent::EndFile {
         reason: EndReason::Eof,
     });

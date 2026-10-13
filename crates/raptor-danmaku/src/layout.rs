@@ -27,7 +27,41 @@ fn mode_to_dfm_type(mode: DanmakuMode) -> DfmType {
     }
 }
 
-fn item_to_dfm(item: &DanmakuItem, index: u32, scroll_dur_ms: i64, fixed_dur_ms: i64) -> DfmItem {
+/// 弹幕文件的字号是按 1080p 窗口录的绝对像素；按**窗口高度**换算，才能在任意
+/// 分辨率 / 屏幕方向下铺满播放器窗口（B 站的观感：字号随播放器大小变化）。
+///
+/// 基准刻意用窗口而不是视频内容：弹幕铺满整个播放器（含黑边），若按视频原生
+/// 分辨率算，竖屏手机播 16:9 视频时字号会小到几乎看不见。
+pub const REFERENCE_VIEWPORT_HEIGHT: f32 = 1080.0;
+
+/// 字号缩放系数下限（超小窗口 / 极低分辨率素材的兜底）
+const FONT_SCALE_MIN: f32 = 0.4;
+/// 字号缩放系数上限（8K 素材的兜底，避免轨道数爆炸）
+const FONT_SCALE_MAX: f32 = 4.0;
+
+/// 默认字号放大系数
+///
+/// XML/ASS 弹幕文件里的字号是按"满屏 1080p"录的，实际播放器窗口通常只有全屏的
+/// 一半不到，按窗口高度换算后正文偏小、远距离可读性差。B 站客户端的默认字号也比
+/// 素材原始值大一档，这里统一乘一个系数当作观感基线。
+const FONT_SIZE_BOOST: f32 = 1.25;
+
+/// 由**窗口高度**算出的字号缩放系数
+pub fn font_scale_for(window_height: f32) -> f32 {
+    if window_height <= 0.0 {
+        return FONT_SIZE_BOOST;
+    }
+    (window_height / REFERENCE_VIEWPORT_HEIGHT * FONT_SIZE_BOOST)
+        .clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)
+}
+
+fn item_to_dfm(
+    item: &DanmakuItem,
+    index: u32,
+    scroll_dur_ms: i64,
+    fixed_dur_ms: i64,
+    font_scale: f32,
+) -> DfmItem {
     let dfm_type = mode_to_dfm_type(item.mode);
     let duration_ms = match item.mode {
         DanmakuMode::ScrollRight | DanmakuMode::ScrollLeft => scroll_dur_ms,
@@ -38,7 +72,7 @@ fn item_to_dfm(item: &DanmakuItem, index: u32, scroll_dur_ms: i64, fixed_dur_ms:
         item.time_ms as i64,
         item.text.clone(),
         item.color,
-        item.font_size as f32,
+        item.font_size as f32 * font_scale,
         dfm_type,
         duration_ms,
     );
@@ -83,6 +117,9 @@ impl LayoutEngine {
         let outline_multiplier = self.config.outline_multiplier.clamp(0.0, 4.0);
 
         let flags = GlobalFlags::default();
+        // 布局和光栅化共用这一个系数，否则占位宽度与实绘宽度不一致，
+        // 轨道碰撞检测会算错（弹幕重叠 / 留异常空隙）
+        let font_scale = self.config.font_scale;
 
         // ── 1. 构建 DFM 内部 item 列表 ──
         let mut dfm_items: Vec<(u32, DfmItem)> = items
@@ -92,8 +129,9 @@ impl LayoutEngine {
                 if matches!(item.mode, DanmakuMode::Advanced) {
                     return None;
                 }
-                let mut dfm = item_to_dfm(item, i as u32, scroll_dur_ms, fixed_dur_ms);
-                let outline_px = resolve_outline_px(item.font_size as f32, outline_multiplier);
+                let mut dfm = item_to_dfm(item, i as u32, scroll_dur_ms, fixed_dur_ms, font_scale);
+                let outline_px =
+                    resolve_outline_px(item.font_size as f32 * font_scale, outline_multiplier);
                 dfm.measure_with_outline(view_w, view_h, &flags, outline_px);
                 Some((i as u32, dfm))
             })
@@ -322,6 +360,9 @@ impl LayoutEngine {
         let new_config = DanmakuConfig {
             viewport_width: new_width,
             viewport_height: new_height,
+            // font_scale 由调用方按**视频原生分辨率**给出（见 font_scale_for）：
+            // 字号已经与视口解耦，这里再按 new_height 重算等于把字号绑回窗口尺寸。
+            font_scale: config.font_scale,
             ..config.clone()
         };
         let engine = LayoutEngine::new(new_config);
@@ -425,7 +466,10 @@ impl PreparedLayout {
                     end_x: inst.end_x,
                     y: inst.y,
                     text_width: inst.text_width,
-                    font_size: inst.item.font_size,
+                    // 必须存**缩放后**的字号：光栅化直接拿这个值来选字形尺寸。
+                    // 存原始值会让"占位宽度按缩放算、实际字形按原始像素画"，
+                    // 两者不一致 —— 这正是文字看起来被压窄的直接原因。
+                    font_size: (inst.item.font_size as f32 * config.font_scale).round() as u32,
                     color: inst.item.color,
                     is_scroll,
                     text: inst.item.text.clone(),
@@ -734,6 +778,150 @@ mod tests {
         let prepared = PreparedLayout::empty(8.0, 4.0);
         let frame = prepared.query_frame(5.0);
         assert!(frame.items.is_empty());
+    }
+
+    /// 弹幕字号随**窗口高度**缩放，且布局与光栅化用同一个系数
+    ///
+    /// 弹幕铺满整个播放器窗口（含黑边），所以字号按窗口高度走 —— 与字幕不同，
+    /// 字幕是按视频原生分辨率（内容基准）。这条曾经被改成内容基准，真机反馈是
+    /// 「字偏小 + 竖屏下轨道数骤减导致弹幕中途消失」。
+    ///
+    /// 另一条独立约束：`PreparedItem.font_size` 必须存**缩放后**的值。存原始值会让
+    /// 「占位宽度按缩放算、实际字形按原始像素画」不一致，轨道碰撞检测因此算错，
+    /// 表现为弹幕被压窄。
+    #[test]
+    fn font_size_scales_with_window_height_and_is_shared_by_layout_and_raster() {
+        let items = vec![make_item(0, DanmakuMode::ScrollRight, "测试弹幕")];
+
+        // 1080p 窗口：scale = 1.25（默认放大系数），字号 = 文件的 25 → 31
+        let cfg_hd = DanmakuConfig {
+            font_scale: font_scale_for(1080.0),
+            ..Default::default()
+        };
+        let engine_hd = LayoutEngine::new(cfg_hd);
+        let prepared_hd = engine_hd.prepare(&engine_hd.layout(&items));
+        assert_eq!(
+            prepared_hd.items[0].font_size, 31,
+            "1080p 应得到放大一档的字号"
+        );
+
+        // 半高窗口（手机横屏 / 小窗播放）：scale = 0.625，字号 25 → 16
+        let cfg_small = DanmakuConfig {
+            viewport_width: 960.0,
+            viewport_height: 540.0,
+            font_scale: font_scale_for(540.0),
+            ..Default::default()
+        };
+        let engine_small = LayoutEngine::new(cfg_small);
+        let prepared_small = engine_small.prepare(&engine_small.layout(&items));
+        assert_eq!(
+            prepared_small.items[0].font_size, 16,
+            "540p window should halve the font size (got {})",
+            prepared_small.items[0].font_size
+        );
+
+        // 手机竖屏（2340 高）：scale ≈ 2.71，字号显著放大 —— 这是弹幕"铺满窗口"
+        // 的预期观感，也是曾经被误改成内容基准后显得偏小的原因
+        let cfg_portrait = DanmakuConfig {
+            viewport_width: 1080.0,
+            viewport_height: 2340.0,
+            font_scale: font_scale_for(2340.0),
+            ..Default::default()
+        };
+        let engine_portrait = LayoutEngine::new(cfg_portrait);
+        let prepared_portrait = engine_portrait.prepare(&engine_portrait.layout(&items));
+        assert!(
+            prepared_portrait.items[0].font_size > 31,
+            "tall window should enlarge font, got {}",
+            prepared_portrait.items[0].font_size
+        );
+    }
+
+    /// 轨道数必须跟着**窗口**高度走，不能被画面矩形压扁
+    ///
+    /// 防回归：曾把布局视口从整个窗口换成 letterbox 后的画面矩形。竖屏手机播
+    /// 16:9 视频时画面矩形只有 ~608px 高，轨道数从 ~60 掉到 ~16，
+    /// overwriteInsert 于是频繁挤掉**正在屏幕上**的老弹幕 —— 表现为「刚出现就
+    /// 突然消失」。
+    #[test]
+    fn track_count_follows_window_height_not_video_rect() {
+        // 竖屏 surface 1080x2340，播 16:9 视频 → 画面矩形只有 1080x608
+        let area = raptor_render::OverlayArea::new(1080, 2340, 1920, 1080);
+        let window_tracks = (area.surface_height as f32 / 37.5).floor() as u32;
+        let rect_tracks = (area.rect_height() / 37.5).floor() as u32;
+
+        assert!(
+            rect_tracks * 2 < window_tracks,
+            "画面矩形轨道数 {} 应远少于窗口轨道数 {}",
+            rect_tracks,
+            window_tracks
+        );
+
+        // 用窗口高度布局时轨道数必须充裕
+        let cfg = DanmakuConfig {
+            viewport_width: area.surface_width as f32,
+            viewport_height: area.surface_height as f32,
+            font_scale: font_scale_for(area.surface_height as f32),
+            ..Default::default()
+        };
+        let engine = LayoutEngine::new(cfg);
+        let items: Vec<DanmakuItem> = (0..12)
+            .map(|i| make_item(0, DanmakuMode::ScrollRight, &format!("弹幕{}", i)))
+            .collect();
+        let instances = engine.layout(&items);
+
+        // 12 条同时刻弹幕在窗口基准下应全部排得下，且互不同轨
+        assert_eq!(
+            instances.len(),
+            12,
+            "窗口轨道充足时不应有弹幕被挤掉，实得 {}",
+            instances.len()
+        );
+        let mut ys: Vec<f32> = instances.iter().map(|i| i.y).collect();
+        ys.sort_by(f32::total_cmp);
+        assert_eq!(
+            ys.windows(2).filter(|w| w[0] == w[1]).count(),
+            0,
+            "同轨不应重叠：{ys:?}"
+        );
+    }
+
+    /// relayout 只改位置，字号由调用方给的系数决定
+    #[test]
+    fn relayout_changes_positions_and_uses_caller_font_scale() {
+        let items = vec![make_item(0, DanmakuMode::ScrollRight, "test")];
+
+        let cfg = DanmakuConfig {
+            font_scale: font_scale_for(1080.0),
+            ..Default::default()
+        };
+
+        let engine = LayoutEngine::new(cfg.clone());
+        let before = engine.prepare(&engine.layout(&items));
+
+        // 把窗口缩小一半
+        let (instances, after) = LayoutEngine::relayout(&items, 960.0, 540.0, &cfg);
+
+        // 调用方给的系数被原样保留（窗口变了不等于字号要变）
+        assert_eq!(
+            after.items[0].font_size, before.items[0].font_size,
+            "relayout 不得自行改写 font_scale"
+        );
+        // 位置必须跟着新窗口尺寸走
+        assert_eq!(instances[0].start_x, 960.0, "滚动起点应等于新的窗口宽度");
+    }
+
+    #[test]
+    fn font_scale_clamps_and_guards_zero() {
+        assert_eq!(
+            font_scale_for(0.0),
+            FONT_SIZE_BOOST,
+            "zero height must not divide by zero"
+        );
+        assert_eq!(font_scale_for(1080.0), FONT_SIZE_BOOST);
+        // 极端值必须被夹住，否则小字变大字、轨道数爆炸
+        assert!(font_scale_for(1.0) >= 0.4);
+        assert!(font_scale_for(100000.0) <= 4.0);
     }
 
     #[test]

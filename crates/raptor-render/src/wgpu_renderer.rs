@@ -1,7 +1,7 @@
 use crate::clock::OverlayClock;
-use crate::overlay::OverlayStack;
+use crate::overlay::{fit_video_rect, OverlayArea, OverlayStack};
+use crate::video_output::VideoOutput;
 use crate::yuv_pipeline::{color_params_bytes, interleave_uv_planes, setup_yuv_pipeline};
-use raptor_core::Result;
 use raptor_ffmpeg::{PixelFormat, VideoFrame};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,103 +22,6 @@ const VSYNC_POLL_BUDGET: Duration = Duration::from_millis(4);
 const PENDING_FRAME_CAPACITY: usize = 2;
 /// 刷新率探测间隔（窗口可能被拖到另一块显示器上）
 const REFRESH_PROBE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// HUD 播放统计 — 用于窗口标题栏显示
-#[derive(Debug, Clone, Default)]
-pub struct HudStats {
-    pub paused: bool,
-    pub video_codec: String,
-    pub audio_codec: String,
-    pub width: u32,
-    pub height: u32,
-    pub fps: f64,
-    pub position_secs: f64,
-    pub duration_secs: f64,
-    pub rendered_frames: u64,
-    pub dropped_frames: u64,
-    pub subtitle_on: bool,
-    pub danmaku_on: bool,
-    pub danmaku_count: u32,
-}
-
-/// 平台原生 Surface 句柄 — 用于外部 Surface 注入（Android / 嵌入式）
-///
-/// FFI 层将平台原生窗口指针封装为此类型，供 `ExternalRenderer` 创建 wgpu Surface。
-/// 各平台含义：
-/// - Android: `native_window` = `ANativeWindow*`
-/// - 其他平台可扩展（如 WaylandSurface、XlibWindow 等）
-#[derive(Debug, Clone, Copy)]
-pub struct SurfaceHandle {
-    /// 平台原生窗口指针（Android: `ANativeWindow*`）
-    pub native_window: u64,
-    /// 平台原生显示连接（Android 不使用，保留为 0）
-    pub native_display: u64,
-    /// Surface 宽度（像素）
-    pub width: u32,
-    /// Surface 高度（像素）
-    pub height: u32,
-}
-
-impl SurfaceHandle {
-    pub fn new(native_window: u64, native_display: u64, width: u32, height: u32) -> Self {
-        Self {
-            native_window,
-            native_display,
-            width,
-            height,
-        }
-    }
-}
-
-/// VideoOutput trait — 视频输出抽象
-pub trait VideoOutput: Send {
-    fn init(&mut self, width: u32, height: u32) -> Result<()>;
-    fn submit_frame(&mut self, frame: &VideoFrame) -> Result<()>;
-    fn set_size(&mut self, width: u32, height: u32) -> Result<()>;
-    fn texture_id(&self) -> Option<i64> {
-        None
-    }
-    fn supports_native_hw_frame(&self) -> bool {
-        false
-    }
-    fn should_stop(&self) -> bool {
-        false
-    }
-    fn poll(&mut self) {}
-    /// 获取渲染线程累计渲染帧总数（用于计算实时 FPS）
-    fn render_frame_count(&self) -> u64 {
-        0
-    }
-    /// 更新窗口标题（用于 HUD 信息显示）
-    fn set_title(&mut self, _title: &str) {}
-
-    /// 冻结叠加层挂钟（暂停/EOF 时调用）
-    ///
-    /// 渲染线程会在两个视频帧之间按挂钟外推 Overlay 时间，暂停时必须冻结，
-    /// 否则画面静止而弹幕继续滑动。
-    fn freeze_overlay_clock(&self) {}
-
-    /// 设置 Overlay 叠加层（字幕、弹幕等）
-    ///
-    /// 默认实现为 no-op，具体实现在各 Renderer 中。
-    fn set_overlays(&mut self, _overlays: Vec<Box<dyn crate::overlay::Overlay>>) {}
-
-    // === Surface 生命周期（Android / 嵌入式平台） ===
-
-    /// 分离当前 Surface（Surface 被销毁时调用，如 Android onPause）
-    ///
-    /// 渲染线程将暂停上屏，但保持解码状态不变。
-    fn detach_surface(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    /// 重新附加 Surface（Surface 重建时调用，如 Android onResume）
-    ///
-    /// 渲染线程使用新的 SurfaceHandle 重建 wgpu Surface 并恢复上屏。
-    fn reattach_surface(&mut self, _handle: SurfaceHandle) -> Result<()> {
-        Ok(())
-    }
-}
 
 enum WindowCmd {
     Frame(VideoFrame),
@@ -223,6 +126,8 @@ impl WindowRenderer {
         }))
         .map_err(|e| format!("device: {e}"))?;
 
+        crate::wgpu_instance::install_nonfatal_error_handler(&device);
+
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
@@ -310,6 +215,7 @@ impl WindowRenderer {
     fn pump_events(&mut self) {
         let mut should_close = false;
         let mut new_size: Option<(u32, u32)> = None;
+        let mut scale_factor_changed = false;
         // 非阻塞取事件：节拍由 run() 的 recv_timeout 提供，这里绝不等待，
         // 否则每个渲染周期都要白等数毫秒，把上屏速率压到刷新率以下
         let _ = self
@@ -323,10 +229,22 @@ impl WindowRenderer {
                         winit::event::WindowEvent::Resized(size) => {
                             new_size = Some((size.width.max(1), size.height.max(1)));
                         }
+                        // 窗口被拖到不同 DPI 的显示器上：winit **不保证**补发 Resized，不接住这个
+                        // 事件就会一直用旧的物理尺寸配置 surface —— 画面发糊，
+                        // 字幕/弹幕也按错误尺寸布局。
+                        // 这里只置标志，尺寸回读放到 pump_events 之外做：
+                        // 事件回调里再进窗口查询会在部分平台撞上 maybe_wait_on_main。
+                        winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                            scale_factor_changed = true;
+                        }
                         _ => {}
                     }
                 }
             });
+        if scale_factor_changed {
+            let s = self.window.inner_size();
+            new_size = Some((s.width.max(1), s.height.max(1)));
+        }
         if should_close {
             self.window_should_close = true;
         }
@@ -495,21 +413,11 @@ impl WindowRenderer {
             }
         };
 
-        // 计算保持视频比例的 viewport（letterbox / pillarbox）
-        let surf_w = surface_texture.texture.width() as f32;
-        let surf_h = surface_texture.texture.height() as f32;
-        let video_w = self.width as f32;
-        let video_h = self.height as f32;
-        let viewport = if video_w > 0.0 && video_h > 0.0 {
-            let scale = (surf_w / video_w).min(surf_h / video_h);
-            let vp_w = (video_w * scale).round();
-            let vp_h = (video_h * scale).round();
-            let vp_x = ((surf_w - vp_w) / 2.0).round();
-            let vp_y = ((surf_h - vp_h) / 2.0).round();
-            (vp_x, vp_y, vp_w, vp_h)
-        } else {
-            (0.0, 0.0, surf_w, surf_h)
-        };
+        // 视频画面矩形（letterbox / pillarbox）—— 与 overlay 共用同一份计算：
+        // 两边各自算就会在 pillarbox 时让字幕/弹幕落到黑边上
+        let surf_w = surface_texture.texture.width();
+        let surf_h = surface_texture.texture.height();
+        let video_rect = fit_video_rect(surf_w, surf_h, self.width, self.height);
 
         let view = surface_texture
             .texture
@@ -534,7 +442,14 @@ impl WindowRenderer {
             });
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_viewport(viewport.0, viewport.1, viewport.2, viewport.3, 0.0, 1.0);
+            pass.set_viewport(
+                video_rect.0,
+                video_rect.1,
+                video_rect.2,
+                video_rect.3,
+                0.0,
+                1.0,
+            );
             pass.draw(0..4, 0..1);
         }
         // 渲染所有 Overlay 叠加层（字幕、弹幕等）
@@ -547,8 +462,7 @@ impl WindowRenderer {
                 &mut encoder,
                 &view,
                 self.surface_config.format,
-                surface_texture.texture.width(),
-                surface_texture.texture.height(),
+                OverlayArea::new(surf_w, surf_h, self.width, self.height),
             );
         }
 

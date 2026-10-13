@@ -12,8 +12,8 @@
 //! 支持 Android Activity 生命周期（onPause 时 Surface 销毁，onResume 时重建）。
 
 use crate::clock::OverlayClock;
-use crate::overlay::OverlayStack;
-use crate::wgpu_renderer::SurfaceHandle;
+use crate::overlay::{fit_video_rect, OverlayArea, OverlayStack};
+use crate::video_output::SurfaceHandle;
 use crate::yuv_pipeline::{color_params_bytes, interleave_uv_planes, setup_yuv_pipeline};
 use raptor_core::Result;
 use raptor_ffmpeg::{PixelFormat, VideoFrame};
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use super::wgpu_renderer::VideoOutput;
+use super::video_output::VideoOutput;
 
 /// 无 vsync 平台上的兜底渲染周期（60Hz）
 const EXT_FALLBACK_FRAME_PERIOD: Duration = Duration::from_micros(16_667);
@@ -138,6 +138,9 @@ impl ExtRenderState {
             trace: Default::default(),
         }))
         .map_err(|e| format!("device: {e}"))?;
+
+        // 必须在任何渲染调用之前装，否则首个未捕获错误会直接 abort 掉进程
+        crate::wgpu_instance::install_nonfatal_error_handler(&device);
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
@@ -468,21 +471,10 @@ impl ExtRenderState {
             }
         };
 
-        // 计算 letterbox / pillarbox viewport
-        let surf_w = surface_texture.texture.width() as f32;
-        let surf_h = surface_texture.texture.height() as f32;
-        let video_w = self.video_width as f32;
-        let video_h = self.video_height as f32;
-        let viewport = if video_w > 0.0 && video_h > 0.0 {
-            let scale = (surf_w / video_w).min(surf_h / video_h);
-            let vp_w = (video_w * scale).round();
-            let vp_h = (video_h * scale).round();
-            let vp_x = ((surf_w - vp_w) / 2.0).round();
-            let vp_y = ((surf_h - vp_h) / 2.0).round();
-            (vp_x, vp_y, vp_w, vp_h)
-        } else {
-            (0.0, 0.0, surf_w, surf_h)
-        };
+        // 视频画面矩形（letterbox / pillarbox）—— 与 overlay 共用同一份计算
+        let surf_w = surface_texture.texture.width();
+        let surf_h = surface_texture.texture.height();
+        let video_rect = fit_video_rect(surf_w, surf_h, self.video_width, self.video_height);
 
         let view = surface_texture
             .texture
@@ -507,7 +499,14 @@ impl ExtRenderState {
             });
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_viewport(viewport.0, viewport.1, viewport.2, viewport.3, 0.0, 1.0);
+            pass.set_viewport(
+                video_rect.0,
+                video_rect.1,
+                video_rect.2,
+                video_rect.3,
+                0.0,
+                1.0,
+            );
             pass.draw(0..4, 0..1);
         }
 
@@ -520,8 +519,7 @@ impl ExtRenderState {
                 &mut encoder,
                 &view,
                 self.surface_format,
-                surface_texture.texture.width(),
-                surface_texture.texture.height(),
+                OverlayArea::new(surf_w, surf_h, self.video_width, self.video_height),
             );
         }
 
@@ -560,6 +558,8 @@ fn ext_render_loop(
     tracing::info!("ExternalRenderer: render thread started");
 
     let mut next_tick = Instant::now();
+    let mut last_stats = Instant::now();
+    let mut stats_frames = 0u64;
     'outer: loop {
         // 控制命令优先于视频帧处理：detach 必须抢在积压帧之前生效，
         // 否则会在宿主即将销毁的原生窗口上继续上屏
@@ -637,7 +637,28 @@ fn ext_render_loop(
             continue;
         }
 
+        let frames_before = state.render_frame_count.load(Ordering::Relaxed);
         state.render_tick();
+        stats_frames += state.render_frame_count.load(Ordering::Relaxed) - frames_before;
+
+        // 上屏帧率心跳：真机上没有别的方式能确认渲染线程真的在 present
+        // （SurfaceView 在别的 layer 上，screencap 也不一定抓得到）。
+        if last_stats.elapsed() >= Duration::from_secs(2) {
+            let elapsed = last_stats.elapsed().as_secs_f64();
+            tracing::info!(
+                "ExternalRenderer: presenting {:.1} fps (total {}), pending={}, surface={}",
+                stats_frames as f64 / elapsed,
+                state.render_frame_count.load(Ordering::Relaxed),
+                state.pending_frames.len(),
+                if state.surface.is_some() {
+                    "attached"
+                } else {
+                    "detached"
+                },
+            );
+            stats_frames = 0;
+            last_stats = Instant::now();
+        }
 
         if !state.vsync_locked {
             next_tick += state.frame_period;

@@ -71,6 +71,15 @@ pub struct DanmakuConfig {
     pub max_lines: Option<u32>,
     /// 同屏最大弹幕数（None = 不限制）
     pub max_quantity: Option<u32>,
+    /// 字号缩放系数（1.0 = 用弹幕文件里的原始像素值）
+    ///
+    /// 弹幕文件的 `font_size` 是按某个参考分辨率（bilibili 惯例 1080p）录下的
+    /// 绝对像素。不缩放的话，同一份弹幕在矮屏幕上会大到糊满、在大屏上又小到
+    /// 看不清；旋转或分屏时字号不变，文字相对画面的比例会突变。
+    ///
+    /// 布局（占位宽度、轨道高度）和光栅化必须用**同一个**系数，否则轨道碰撞
+    /// 检测会按一个宽度算、实际按另一个宽度画，表现为弹幕重叠或异常空隙。
+    pub font_scale: f32,
     /// 屏蔽的弹幕类型
     pub blocked_types: Vec<DanmakuMode>,
     /// 屏蔽关键词列表
@@ -99,6 +108,7 @@ impl Default for DanmakuConfig {
             track_gap_ratio: 0.5,
             max_lines: None,
             max_quantity: None,
+            font_scale: 1.0,
             blocked_types: Vec::new(),
             block_words: Vec::new(),
             merge_duplicates: false,

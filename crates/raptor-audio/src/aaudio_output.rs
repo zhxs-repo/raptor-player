@@ -6,7 +6,9 @@
 //! 与 `CpalOutput` 的对比：
 //! - **延迟**: AAudio 原生支持低延迟模式（AAUDIO_PERFORMANCE_MODE_LOW_LATENCY）
 //! - **音频焦点**: 可通过 `setAudioFocus` 管理（Android 8.0+）
-//! - **兼容性**: AAudio 需要 Android 8.0 (API 26+)，与 Raptor 的 minSdk=24 一致
+//! - **兼容性**: AAudio 需要 Android 8.0 (API 26+)，因此 `build.gradle.kts` 的
+//!   minSdk 与 `.cargo/config.toml` 的 NDK target 都锁在 26；Android 上不再引入
+//!   cpal/oboe（见 `raptor-audio/Cargo.toml` 的 target 门控）
 
 #[cfg(target_os = "android")]
 mod aaudio_sys {
@@ -87,6 +89,12 @@ mod aaudio_sys {
     pub type AAudioStreamBuilder = AAudioStreamBuilderStruct;
 
     // FFI function declarations
+    //
+    // `libaaudio.so` ships in the NDK's sysroot from API 26 onwards, so the
+    // link attribute is what actually resolves these symbols at cdylib link
+    // time. `-Wl,--no-undefined` (see raptor-ffmpeg/build.rs) makes a name
+    // typo here a *build* failure instead of a runtime dlopen crash.
+    #[link(name = "aaudio")]
     extern "C" {
         pub fn AAudio_createStreamBuilder(
             builder: *mut *mut AAudioStreamBuilder,
@@ -109,7 +117,11 @@ mod aaudio_sys {
             channelCount: i32,
         );
 
-        pub fn AAudioStreamBuilder_setSampleFormat(
+        // NOTE: the NDK spells this `setFormat`, not `setSampleFormat`. A wrong
+        // name here would link silently (undefined symbols are allowed in a
+        // cdylib) and only fail on the device as
+        // `dlopen failed: undefined symbol: AAudioStreamBuilder_setSampleFormat`.
+        pub fn AAudioStreamBuilder_setFormat(
             builder: *mut AAudioStreamBuilder,
             format: aaudio_format_t,
         );
@@ -173,7 +185,7 @@ use parking_lot::Mutex;
 use raptor_core::{RaptorError, Result};
 use raptor_ffmpeg::AudioFrame;
 
-use crate::cpal_output::AudioOutput;
+use crate::traits::AudioOutput;
 
 /// AAudio ring buffer 容量上限：约 1 秒的立体声 48kHz 采样
 const MAX_BUFFER_SAMPLES: usize = 48000 * 2;
@@ -248,10 +260,7 @@ impl AudioOutput for AaudioOutput {
             );
             aaudio_sys::AAudioStreamBuilder_setSampleRate(builder, sample_rate as i32);
             aaudio_sys::AAudioStreamBuilder_setChannelCount(builder, channels as i32);
-            aaudio_sys::AAudioStreamBuilder_setSampleFormat(
-                builder,
-                aaudio_sys::AAUDIO_FORMAT_PCM_FLOAT,
-            );
+            aaudio_sys::AAudioStreamBuilder_setFormat(builder, aaudio_sys::AAUDIO_FORMAT_PCM_FLOAT);
             aaudio_sys::AAudioStreamBuilder_setPerformanceMode(
                 builder,
                 aaudio_sys::AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,

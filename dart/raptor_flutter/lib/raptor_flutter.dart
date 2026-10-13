@@ -30,4 +30,5 @@ library;
 
 export 'package:raptor_player/raptor_player.dart';
 
+export 'src/raptor_file_picker.dart' show RaptorFilePicker, PickedFile;
 export 'src/raptor_video_view.dart' show RaptorVideoView;

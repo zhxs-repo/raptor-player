@@ -2,7 +2,7 @@
 //! 以及 \move 定位与 \fad 淡入淡出在像素层面的效果。
 //! 无可用 GPU / 字体时软跳过。
 
-use raptor_render::Overlay;
+use raptor_render::{Overlay, OverlayArea};
 use raptor_subtitle::{load_system_font, AssEvent, AssParser, SubtitleConfig, SubtitleEngine};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -96,7 +96,15 @@ fn render_frame(engine: &mut SubtitleEngine, gpu: &Gpu, pts: f64) -> (usize, Opt
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("smoke_encoder"),
         });
-    engine.render(&gpu.device, &gpu.queue, &mut encoder, &view, FORMAT, W, H);
+    // 无视频信息（video=0）→ 画面矩形退化到全屏，字号系数回落到 1.0
+    engine.render(
+        &gpu.device,
+        &gpu.queue,
+        &mut encoder,
+        &view,
+        FORMAT,
+        OverlayArea::new(W, H, 0, 0),
+    );
 
     let bytes_per_row = W * 4; // 1280，满足 256 对齐
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {

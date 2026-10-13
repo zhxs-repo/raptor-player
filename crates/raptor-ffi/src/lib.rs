@@ -19,6 +19,9 @@ macro_rules! cabi {
     };
 }
 
+#[cfg(target_os = "android")]
+mod android_log;
+
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::Arc;
@@ -37,7 +40,10 @@ use raptor_core::{
 use raptor_danmaku::{DanmakuConfig, DanmakuEngine};
 use raptor_ffmpeg::{Demuxer, FfmpegDemuxer};
 use raptor_pipeline::{Pipeline, PipelineHandles, RendererCmd};
-use raptor_render::{ExternalRenderer, SharedOverlay, SurfaceHandle, VideoOutput, WgpuRenderer};
+use raptor_render::{ExternalRenderer, SharedOverlay, SurfaceHandle, VideoOutput};
+
+#[cfg(not(target_os = "android"))]
+use raptor_render::WgpuRenderer;
 use raptor_subtitle::{SubtitleConfig, SubtitleEngine};
 
 /// 播放器核心 — 持有状态机 + pipeline + 属性存储
@@ -55,6 +61,11 @@ pub struct Player {
     subtitle_engine: Mutex<Option<Arc<Mutex<SubtitleEngine>>>>,
     /// 弹幕引擎（SharedOverlay 包装，与渲染线程共享）
     danmaku_engine: Mutex<Option<Arc<Mutex<DanmakuEngine>>>>,
+    /// 当前加载的媒体路径
+    ///
+    /// 播完之后 seek 需要重新 load 同一个文件（EOF 时 demuxer 已无法 seek），
+    /// 没有这个字段就没法重载。
+    current_source: Mutex<Option<String>>,
     /// 待使用的 Surface 句柄（set_surface 在 load_file 之前调用时暂存）
     pending_surface: Mutex<Option<SurfaceHandle>>,
     /// 渲染器命令发送端（FFI 层 → render_loop，用于运行时 Surface 管理）
@@ -73,6 +84,7 @@ impl Player {
             position_reporter: Mutex::new(None),
             subtitle_engine: Mutex::new(None),
             danmaku_engine: Mutex::new(None),
+            current_source: Mutex::new(None),
             pending_surface: Mutex::new(None),
             renderer_cmd_tx: Mutex::new(None),
         }
@@ -218,11 +230,30 @@ impl Player {
                     })?;
                     Box::new(ext)
                 } else {
-                    let mut r = WgpuRenderer::new();
-                    if let Some(ref vi) = video_info {
-                        r.init(vi.width, vi.height)?;
+                    // No surface was handed to us.
+                    //
+                    // On desktop the WgpuRenderer can open its own window, but on
+                    // Android there is no winit and no way to obtain an
+                    // ANativeWindow from Rust — Flutter must call
+                    // raptor_set_surface first. Failing here with a clear message
+                    // beats the alternative (a winit EventLoop error, or a
+                    // black SurfaceView).
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let mut r = WgpuRenderer::new();
+                        if let Some(ref vi) = video_info {
+                            r.init(vi.width, vi.height)?;
+                        }
+                        Box::new(r) as Box<dyn VideoOutput>
                     }
-                    Box::new(r)
+                    #[cfg(target_os = "android")]
+                    {
+                        return Err(raptor_core::RaptorError::Render(
+                            "load_file called before raptor_set_surface: \
+                             on Android the native window must be attached first"
+                                .into(),
+                        ));
+                    }
                 };
 
             // 创建字幕和弹幕引擎，并通过 SharedOverlay 包装后设置到渲染器
@@ -231,10 +262,25 @@ impl Player {
             let danmaku_engine = Arc::new(Mutex::new(DanmakuEngine::new(DanmakuConfig::default())));
 
             // 自动加载系统字体（供字幕和弹幕光栅化文本使用）
-            if let Some(font_data) = raptor_subtitle::load_system_font() {
-                subtitle_engine.lock().set_font(font_data.clone());
-                danmaku_engine.lock().set_font(font_data);
-                tracing::info!("load_file: system font loaded for subtitle/danmaku engines");
+            match raptor_subtitle::load_system_font() {
+                Some(font_data) => {
+                    subtitle_engine.lock().set_font(font_data.clone());
+                    danmaku_engine.lock().set_font(font_data);
+                    tracing::info!("load_file: system font loaded for subtitle/danmaku engines");
+                }
+                // 没有字体时视频/音频照常播放，但字幕和弹幕会一个字都不出。
+                // 只写日志的话 GUI 上完全看不出来，所以补一条 Error 事件。
+                // 这里不走 fail()：播放本身没失败，不该把状态机推到 Error。
+                None => {
+                    tracing::error!(
+                        "load_file: no system font found; subtitle and danmaku text will not render"
+                    );
+                    let _ = self.event_tx.send(RaptorEvent::Error {
+                        code: ErrorCode::RenderError as i32,
+                        message: "no system font available: subtitles and danmaku will not render"
+                            .into(),
+                    });
+                }
             }
 
             // 在 renderer 被移入 pipeline 之前设置 overlays
@@ -315,6 +361,9 @@ impl Player {
                 audio: audio_info.clone(),
             });
 
+            // 记录路径：播完之后 seek 要靠它重新加载
+            *self.current_source.lock() = Some(url.to_string());
+
             tracing::info!("load_file: ready, duration={:.2}s", duration);
             Ok(CommandResult::MediaInfo(MediaInfo {
                 duration,
@@ -394,6 +443,8 @@ impl Player {
 
         self.stop_pipeline();
         Self::write_state(&self.state, PlayerState::Stopped);
+        // 路径保留：播完之后用户拖进度条仍要能从这里重载。
+        // 只清 overlay，不清 current_source。
         Ok(CommandResult::Empty)
     }
 
@@ -406,15 +457,36 @@ impl Player {
             )));
         }
 
-        // 状态检查：只有 Playing 和 Paused 可以 seek
-        let state = self.state.lock();
-        state
-            .can_transition_to(&PlayerEvent::Seek {
-                target,
-                mode: SeekMode::Absolute,
-            })
-            .map_err(RaptorError::InvalidState)?;
-        drop(state);
+        // 状态检查：Playing / Paused 之外，还有一种必须放行的情况 ——
+        // 播放刚结束（EndFile 已发出、render_loop 已退出，状态机还停在 Playing）。
+        //
+        // 不放行的话，播完之后把进度条往回拖会被 can_transition_to 拒掉，
+        // Dart 侧抛异常，滑块停在末尾不动 —— 正是"拉回开头没反应"的现象。
+        //
+        // 这里不试图复活已经退出的线程，而是重新 load 一次：FFmpeg 的 demuxer
+        // 在 EOF 之后无法再 seek，重建管线是唯一可靠的做法。
+        let state = self.state();
+        if !matches!(state, PlayerState::Playing | PlayerState::Paused) {
+            return Err(RaptorError::InvalidState(format!(
+                "cannot seek from {state:?}"
+            )));
+        }
+
+        // 已播完 → 重载后跳到目标位置。EOF 时所有工作线程都退出了，
+        // 走下面的常规 seek 路径不会有任何消费者，滑块会弹回末尾。
+        let (ended, duration) = self
+            .pipeline
+            .lock()
+            .as_ref()
+            .map(|p| (p.has_ended(), p.duration_secs()))
+            .unwrap_or((false, 0.0));
+        if ended && target < duration - 0.1 {
+            tracing::info!(
+                "seek: pipeline already ended, reloading to resume at {:.3}s",
+                target
+            );
+            return self.restart_at(target);
+        }
 
         // Clamp target to duration if available
         let clamped_target = if let Some(pipeline) = self.pipeline.lock().as_ref() {
@@ -452,6 +524,35 @@ impl Player {
             to: clamped_target,
         });
         Ok(CommandResult::Empty)
+    }
+
+    /// 播完之后 seek：重建管线，从 [target] 继续播。
+    ///
+    /// FFmpeg 的 demuxer 在 EOF 之后不再接受 seek —— 它已经读到文件尾了。
+    /// 所以这里走"重新 load 同一个文件"的路径：线程全部重建、demuxer 回到
+    /// 文件头，再把首个 seek 请求交给新管线。
+    ///
+    /// 字幕/弹幕引擎是 FFI 层持有的独立对象，load_file 不会清空它们，
+    /// 重载后叠加层自动接上。
+    fn restart_at(&self, target: f64) -> raptor_core::Result<CommandResult> {
+        let path = self.current_source.lock().clone().ok_or_else(|| {
+            RaptorError::InvalidState("cannot restart: no source path recorded".into())
+        })?;
+
+        self.stop_pipeline();
+        // load_file 自身会再次 stop_pipeline（幂等），并重建全部线程
+        let result = self.load_file(&path)?;
+        // 新管线从 0 开始播，把 seek 请求交给它的 demux_loop
+        if let Some(pipeline) = self.pipeline.lock().as_ref() {
+            *pipeline.seek_request.lock() =
+                Some(raptor_pipeline::pipeline::SeekRequest { target, from: 0.0 });
+        }
+        self.play()?;
+        let _ = self.event_tx.send(RaptorEvent::Seek {
+            from: 0.0,
+            to: target,
+        });
+        Ok(result)
     }
 
     fn stop_pipeline(&self) {
@@ -799,6 +900,13 @@ impl Drop for RaptorHandle {
 /// 创建播放器实例
 fn raptor_create_impl() -> *mut RaptorHandle {
     // 初始化日志
+    //
+    // Android 上没有 RUST_LOG，stdout 也不通往任何有用的地方，所以改写到
+    // logcat（`adb logcat -s raptor`）。见 android_log 模块的说明。
+    #[cfg(target_os = "android")]
+    crate::android_log::init();
+
+    #[cfg(not(target_os = "android"))]
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();

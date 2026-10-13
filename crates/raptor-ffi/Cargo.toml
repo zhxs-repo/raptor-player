@@ -22,6 +22,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Android-only: routes tracing output to logcat. Without it the player is
+# completely silent on device (no RUST_LOG, stdout discarded by the app sandbox).
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.13"
+log = "0.4"
+
 [[example]]
 name = "cli_player"
 path = "examples/cli_player.rs"

@@ -37,6 +37,11 @@ pub struct Pipeline {
     pub position_us: Arc<AtomicU64>,
     pub duration_us: Arc<AtomicU64>,
     pub demux_complete: Arc<AtomicBool>,
+    /// 已跑到自然结尾（render_loop 判定 EOF 后置位）
+    ///
+    /// 与 `shutdown` 分开：shutdown 是外部要求停，ended 是自己播完了。
+    /// 播完之后所有工作线程都退出了，seek 请求没有消费者。
+    pub ended: Arc<AtomicBool>,
     /// demux 读出的包总数 — 看门狗的"上游还在动"心跳
     ///
     /// 解码线程只看自己收不到数据，分不清是"这条流恰好没数据了"还是"上游
@@ -66,6 +71,7 @@ impl Pipeline {
             position_us: Arc::new(AtomicU64::new(0)),
             duration_us: Arc::new(AtomicU64::new(0)),
             demux_complete: Arc::new(AtomicBool::new(false)),
+            ended: Arc::new(AtomicBool::new(false)),
             demux_progress: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             paused,
@@ -104,6 +110,14 @@ impl Pipeline {
     /// 检查是否暂停
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    /// 管线是否已经跑到自然结尾（render_loop 判定 EOF 并退出）
+    ///
+    /// 播完之后线程都退了，seek 请求没人消费 —— 调用方需要知道这一点才能
+    /// 决定是重载文件还是直接拒绝。
+    pub fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
     }
 
     /// 设置音量 (0-100)
@@ -208,6 +222,7 @@ impl Pipeline {
             position_us: self.position_us.clone(),
             duration_us: self.duration_us.clone(),
             demux_complete: self.demux_complete.clone(),
+            ended: self.ended.clone(),
             demux_progress: self.demux_progress.clone(),
             shutdown: self.shutdown.clone(),
             paused: self.paused.clone(),

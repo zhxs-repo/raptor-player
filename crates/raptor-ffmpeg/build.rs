@@ -35,7 +35,12 @@ fn main() {
         println!("cargo:warning=raptor-ffmpeg: pkg-config path = {path}");
     }
 
-    // Try arch-specific FFMPEG_DIR first, then generic
+    // Try arch-specific FFMPEG_DIR first, then generic.
+    //
+    // ffmpeg-sys-next only looks at the un-suffixed FFMPEG_DIR, so the
+    // per-ABI variable has to be forwarded to it under that exact name --
+    // otherwise it silently falls through to pkg-config and the build dies
+    // much later with confusing missing-libraries errors.
     let dir_key = format!("FFMPEG_DIR_{target_env}");
     if let Ok(dir) = std::env::var(&dir_key) {
         std::env::set_var("FFMPEG_DIR", &dir);
@@ -47,7 +52,15 @@ fn main() {
         // Tell the linker where to find FFmpeg .so files
         println!("cargo:rustc-link-search=native={lib_dir}");
 
-        // Link FFmpeg libraries (order matters for static linking)
+        // Link FFmpeg libraries.
+        //
+        // Android links against static archives only: the .a files are baked
+        // straight into libraptor_ffi.so, so the APK ships one native library
+        // instead of six libav*.so files that would also need matching
+        // DT_NEEDED sonames at load time.
+        //
+        // Order matters for static archives: dependents come before
+        // dependencies (avformat -> avcodec -> ... -> avutil).
         for lib in &[
             "avformat",
             "avcodec",
@@ -56,8 +69,21 @@ fn main() {
             "swresample",
             "avutil",
         ] {
-            println!("cargo:rustc-link-lib={lib}");
+            println!("cargo:rustc-link-lib=static={lib}");
         }
+
+        // Android system libraries FFmpeg pulls in even with
+        // --disable-autodetect (libc math + the logcat logger). The NDK sysroot
+        // provides all three.
+        println!("cargo:rustc-link-lib=m");
+        println!("cargo:rustc-link-lib=log");
+        println!("cargo:rustc-link-lib=dl");
+
+        // No -Wl,--exclude-libs here: `cargo:rustc-link-arg` from a dependency is not
+        // forwarded to the cdylib link anyway, and it is unnecessary -- rustc
+        // emits a version script for every cdylib that hides everything except
+        // the crate's own exported items. The link-time symbol check that does
+        // matter lives in raptor-ffi/build.rs, which is the crate being linked.
 
         // Pass include path to ffmpeg-sys-next (for bindgen)
         println!("cargo:include={include_dir}");

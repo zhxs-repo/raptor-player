@@ -7,14 +7,15 @@
 //! - GPU 端描边（outline draw call）替代 CPU 8 方向描边
 
 use crate::glyph_atlas::{
-    extract_font_from_ttc, GlyphAtlas, GlyphInstance, RenderPlan, TextRasterizer,
+    GlyphAtlas, GlyphInstance, RenderPlan, TextRasterizer, PLACEMENT_CACHE_CAPACITY,
 };
-use crate::layout::{LayoutEngine, PreparedLayout};
+use crate::layout::{font_scale_for, LayoutEngine, PreparedLayout};
 use crate::types::{DanmakuConfig, DanmakuInstance, DanmakuItem};
 use bytemuck;
 use parking_lot::Mutex;
-use raptor_render::Overlay;
-use std::collections::HashMap;
+use raptor_render::font_util::{extract_ttc_preferred, CJK_SC_PREFER};
+use raptor_render::{Overlay, OverlayArea};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// GPU uniform 结构体 — 与 WGSL FrameUniforms 布局匹配（16 bytes）
@@ -52,6 +53,39 @@ impl GpuGlyph {
             color: inst.color_rgba,
         }
     }
+}
+
+/// 一条可见弹幕在当前帧的绘制数据（位置在画面坐标里，字形来自 atlas）
+struct FrameGlyphs {
+    frame_item_x: f32,
+    frame_item_y: f32,
+    /// `frame_item_y` 之上的基线偏移
+    baseline_offset_y: f32,
+    color_rgba: [f32; 4],
+    placements: Arc<Vec<crate::glyph_atlas::TextGlyphPlacement>>,
+}
+
+/// 计算单个字形的上屏矩形（`[x, y, w, h]`，surface 像素）
+///
+/// 布局坐标就是 **surface 像素**（弹幕铺满整个窗口，包括黑边），这里只补上字形在
+/// 文本内的偏移（pen + baseline），不做任何平移。`baseline_y` 必须是**文本基线**的
+/// 纵坐标，不是绘制框顶部 —— 字形位图的 `offset_y` 是相对基线的负值，把它当成顶边
+/// 会让整行文字往上跑出一半，最上面一条轨道就被窗口上沿裁掉。
+///
+/// 字形位图**按原尺寸 1:1 绘制**，这里刻意不做任何缩放 —— 布局已经在 surface 像素
+/// 里完成。曾经这里有一对 `scale_x/scale_y` 参数，恒为 1.0；它们一旦被误用就会让
+/// 字形非等比变形（横向压扁），所以干脆从接口上移除。
+pub(crate) fn glyph_rect_on_screen(
+    item_x: f32,
+    baseline_y: f32,
+    placement: &crate::glyph_atlas::TextGlyphPlacement,
+) -> [f32; 4] {
+    [
+        item_x + placement.pen_x + placement.glyph.offset_x,
+        baseline_y + placement.glyph.offset_y,
+        placement.packed.width as f32,
+        placement.packed.height as f32,
+    ]
 }
 
 /// 把一帧的 outline/fill 实例打包进暂存数组：outline 段在前、fill 段在后
@@ -139,7 +173,14 @@ pub struct DanmakuEngine {
     /// 条目级字形放置缓存：item_index → 该文本的全部字形放置
     ///
     /// 命中时跳过字体解析、逐字形查表与 atlas 打包，消除稳态每帧 CPU 开销。
+    ///
+    /// **必须设上限**：长视频（几小时的直播回放）动辄上万条弹幕，每条都缓存一
+    /// 份 `Vec<TextGlyphPlacement>`（每个字形一个 Arc<RasterizedGlyph>，
+    /// 内含 fill/outline 两张位图）。无上限增长就是播放越久内存越高，
+    /// 最终被系统 OOM kill —— 表现为"看久了崩溃"。
     placement_cache: HashMap<usize, CachedPlacements>,
+    /// 插入顺序，用于按 FIFO 淘汰（配合 PLACEMENT_CACHE_CAPACITY）
+    placement_cache_order: VecDeque<usize>,
     /// wgpu 渲染管线（惰性初始化）
     render_pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
@@ -158,8 +199,19 @@ pub struct DanmakuEngine {
     frame_count: u64,
     /// 首次渲染标志（用于调试日志）
     first_render_logged: bool,
-    /// 上一次渲染的 viewport 尺寸（用于检测窗口大小变化）
-    last_viewport: Option<(u32, u32)>,
+    /// 上一次布局所用的**surface 尺寸**（用于检测窗口大小变化）
+    last_viewport: Option<(f32, f32)>,
+    /// 因 atlas 溢出而整表重建的次数（诊断 / 测试断言）
+    overflow_rebuilds: u64,
+    /// 重建后**仍然**丢字形的次数
+    ///
+    /// 非 0 说明单帧字形需求超过了 atlas 的硬容量上限（2048px 高），光靠重试
+    /// 解决不了，必须靠 `max_lines` / `max_quantity` 控制并发弹幕数。
+    unresolved_drops: u64,
+    /// 绘制阶段被跳过（零尺寸）的字形总数
+    missing_glyphs: u64,
+    /// 字体没有轮廓、因而本就画不出来的字形数（空格 / 缺字，非故障）
+    empty_glyphs: u64,
 }
 
 // Safety: DanmakuEngine is only accessed from one thread at a time via the Overlay trait
@@ -182,6 +234,7 @@ impl DanmakuEngine {
             glyph_atlas: GlyphAtlas::new(),
             rasterizer: TextRasterizer::new(),
             placement_cache: HashMap::new(),
+            placement_cache_order: VecDeque::new(),
             render_pipeline: None,
             bind_group_layout: None,
             sampler: None,
@@ -193,42 +246,50 @@ impl DanmakuEngine {
             frame_count: 0,
             first_render_logged: false,
             last_viewport: None,
+            overflow_rebuilds: 0,
+            unresolved_drops: 0,
+            missing_glyphs: 0,
+            empty_glyphs: 0,
         }
+    }
+
+    /// 累计因 atlas 溢出而整表重建的次数
+    pub fn overflow_rebuilds(&self) -> u64 {
+        self.overflow_rebuilds
+    }
+
+    /// 累计重建后仍然丢字形的次数；非 0 即为真实丢字（弹幕显示不全）
+    pub fn unresolved_drops(&self) -> u64 {
+        self.unresolved_drops
+    }
+
+    /// 绘制阶段被跳过的字形总数
+    pub fn missing_glyphs(&self) -> u64 {
+        self.missing_glyphs
+    }
+
+    /// 字体无轮廓、画不出来的字形数（空格/缺字，非故障）
+    pub fn empty_glyphs(&self) -> u64 {
+        self.empty_glyphs
     }
 
     /// 设置字体数据（支持 TTF/OTF/TTC 格式）
     ///
-    /// TTC 文件会自动提取第一个字体为独立的 TTF 数据，
-    /// 确保 `ab_glyph::FontRef::try_from_slice` 能正确解析。
+    /// TTC 会按 CJK 简体优先挑出一个 face 并重写偏移表，确保
+    /// `ab_glyph::FontRef::try_from_slice` 能正确解析。
     pub fn set_font(&mut self, font_data: Vec<u8>) {
-        if font_data.len() >= 12 && &font_data[0..4] == b"ttcf" {
-            let num_fonts = u32::from_be_bytes(font_data[8..12].try_into().unwrap_or([0, 0, 0, 0]));
-            if num_fonts > 0 {
-                let header_size = 12 + (num_fonts as usize) * 4;
-                if font_data.len() >= header_size {
-                    let offset =
-                        u32::from_be_bytes(font_data[12..16].try_into().unwrap_or([0, 0, 0, 0]))
-                            as usize;
-                    if offset < font_data.len() {
-                        // 使用 extract_font_from_ttc 正确重写偏移表
-                        if let Some(extracted) = extract_font_from_ttc(&font_data, offset) {
-                            tracing::info!(
-                                "DanmakuEngine: TTC font detected ({} fonts), \
-                                 extracted first font ({} bytes)",
-                                num_fonts,
-                                extracted.len()
-                            );
-                            self.font_data = Some(extracted);
-                            self.invalidate_atlas();
-                            return;
-                        }
-                        tracing::warn!(
-                            "DanmakuEngine: TTC extraction failed, using raw slice fallback"
-                        );
-                    }
-                }
+        let font_data = match extract_ttc_preferred(&font_data, CJK_SC_PREFER) {
+            Some(face) => {
+                tracing::info!(
+                    "DanmakuEngine: TTC face #{} '{}' extracted ({} bytes)",
+                    face.index,
+                    face.family,
+                    face.data.len()
+                );
+                face.data
             }
-        }
+            None => font_data,
+        };
         self.font_data = Some(font_data);
         self.invalidate_atlas();
     }
@@ -305,6 +366,7 @@ impl DanmakuEngine {
         self.rasterizer.clear_cache();
         // 缓存里的 PackedGlyph 坐标指向 atlas 纹理，atlas 清空后即失效
         self.placement_cache.clear();
+        self.placement_cache_order.clear();
         self.atlas_cache = None;
         // bind group 里绑的是 atlas 纹理视图，纹理没了就必须重建
         self.draw_cache = None;
@@ -449,49 +511,34 @@ impl DanmakuEngine {
         );
     }
 
-    /// 构建当前帧的渲染计划：frame query → 光栅化 → atlas pack → 生成 GlyphInstance
-    fn build_render_plan_internal(
+    /// 打包本帧可见弹幕的全部字形（Phase 1）
+    ///
+    /// 优先命中条目级 `placement_cache`；未命中才光栅化并打包进 atlas。
+    /// 拆成独立方法是为了让 atlas 溢出时能整表重建后**原样重跑一遍**。
+    ///
+    /// 所有输入都从 `self` 内部取，因此调用方不能持有任何指向 `self` 的借用 ——
+    /// 这样 atlas 溢出后的重试路径才写得出（见 `build_render_plan_internal`）。
+    fn collect_frame_glyphs(
         &mut self,
-        current_time: f64,
-        scale_x: f32,
-        scale_y: f32,
-    ) -> RenderPlan {
-        let state = self.state.lock();
-        let Some(prepared) = state.prepared.as_ref() else {
-            if self.frame_count.is_multiple_of(300) {
-                tracing::warn!("build_render_plan: state.prepared is None");
-            }
-            return RenderPlan::empty();
-        };
-
-        let frame_layout = prepared.query_frame(current_time);
-        if frame_layout.items.is_empty() {
-            // 正常：当前时间无可见弹幕（不输出日志避免刷屏）
-            return RenderPlan::empty();
-        }
-
-        let opacity = state.opacity;
-        let revision = state.prepared_revision;
-
+        frame_layout: &crate::layout::FrameLayout,
+        revision: u64,
+        opacity: f32,
+    ) -> Vec<FrameGlyphs> {
         let Some(font_data) = self.font_data.as_ref() else {
             if self.frame_count.is_multiple_of(300) {
-                tracing::warn!("build_render_plan: font_data is None");
+                tracing::warn!("collect_frame_glyphs: font_data is None");
             }
-            return RenderPlan::empty();
+            return Vec::new();
         };
-        // TTC 已在 set_font 中提取为独立字体数据，直接使用
         let font_slice = font_data.as_slice();
+        // `state` 只用来读 prepared；后续对 rasterizer / atlas / placement_cache 的
+        // 可变借用与它字段不相交，编译期允许。
+        let state = self.state.lock();
+        let Some(prepared) = state.prepared.as_ref() else {
+            return Vec::new();
+        };
 
-        struct FrameGlyphs {
-            frame_item_x: f32,
-            frame_item_y: f32,
-            color_rgba: [f32; 4],
-            placements: Arc<Vec<crate::glyph_atlas::TextGlyphPlacement>>,
-        }
         let mut frame_data: Vec<FrameGlyphs> = Vec::with_capacity(frame_layout.items.len());
-
-        // Phase 1: 取得每条弹幕的字形放置（优先命中条目级缓存），
-        // 未命中才光栅化并打包新字形到 atlas
         for frame_item in &frame_layout.items {
             let prepared_item = &prepared.items[frame_item.item_index];
             let color_rgba = color_u32_to_f32_array(prepared_item.color, opacity);
@@ -512,13 +559,27 @@ impl DanmakuEngine {
                         prepared_item.font_size as f32,
                         &mut self.glyph_atlas,
                     ));
-                    self.placement_cache.insert(
-                        item_index,
-                        CachedPlacements {
-                            revision,
-                            placements: p.clone(),
-                        },
-                    );
+                    if self
+                        .placement_cache
+                        .insert(
+                            item_index,
+                            CachedPlacements {
+                                revision,
+                                placements: p.clone(),
+                            },
+                        )
+                        .is_none()
+                    {
+                        self.placement_cache_order.push_back(item_index);
+                    }
+                    // FIFO 淘汰。淘汰只是丢 CPU 侧缓存：字形位图仍在
+                    // rasterizer.glyph_cache / glyph_atlas 里，再次出现时重算
+                    // placement 即可，不会丢字形。
+                    while self.placement_cache_order.len() > PLACEMENT_CACHE_CAPACITY {
+                        if let Some(old) = self.placement_cache_order.pop_front() {
+                            self.placement_cache.remove(&old);
+                        }
+                    }
                     p
                 }
             };
@@ -527,9 +588,78 @@ impl DanmakuEngine {
                 frame_data.push(FrameGlyphs {
                     frame_item_x: frame_item.x,
                     frame_item_y: frame_item.y,
+                    baseline_offset_y: prepared_item.font_size as f32,
                     color_rgba,
                     placements,
                 });
+            }
+        }
+        frame_data
+    }
+
+    /// 构建当前帧的渲染计划：frame query → 光栅化 → atlas pack → 生成 GlyphInstance
+    ///
+    /// 布局坐标已经是 surface 像素（弹幕铺满整个窗口），所以这里不需要任何偏移或
+    /// 缩放 —— 见 [`glyph_rect_on_screen`]。
+    fn build_render_plan_internal(&mut self, current_time: f64) -> RenderPlan {
+        // 先在锁内算出这一帧的可见集合与快照参数，随即**放掉锁**：
+        // 后面要调用 `&mut self` 的方法，持有任何指向 self 的借用都会冲突。
+        let (frame_layout, revision, opacity) = {
+            let state = self.state.lock();
+            let Some(prepared) = state.prepared.as_ref() else {
+                if self.frame_count.is_multiple_of(300) {
+                    tracing::warn!("build_render_plan: state.prepared is None");
+                }
+                return RenderPlan::empty();
+            };
+
+            let frame_layout = prepared.query_frame(current_time);
+            if frame_layout.items.is_empty() {
+                // 正常：当前时间无可见弹幕（不输出日志避免刷屏）
+                return RenderPlan::empty();
+            }
+            (frame_layout, state.prepared_revision, state.opacity)
+        };
+
+        // Phase 1: 打包本帧字形
+        let mut frame_data = self.collect_frame_glyphs(&frame_layout, revision, opacity);
+
+        // ── atlas 装不下时的自愈 ──────────────────────────────────────
+        //
+        // atlas 高度硬封顶在 2048（GLES 的 max_texture_dimension_2d 下限）。
+        // `pack()` 装不下时返回零尺寸字形，Phase 3 会把它跳过 —— 于是表现为
+        // 「弹幕显示不全」，而且零尺寸结果还会被缓存进 placement_cache 长期
+        // 粘住，历史上这里完全没有任何日志。
+        //
+        // 单帧的字形需求是**有界**的：轨道数（surface 高 / 轨道高）× 平均文本长度。
+        // 真正把 atlas 撑满的是长时间播放后不断涌入的新字符。所以整表重建后，
+        // 本帧要用的字形必然装得下 —— 直接重建并重试一次即可自愈。
+        let dropped = self.glyph_atlas.take_dropped();
+        if dropped > 0 {
+            tracing::warn!(
+                "DanmakuEngine: atlas overflowed, {} glyph(s) dropped (height={}, kinds={}); \
+                 rebuilding atlas and retrying this frame",
+                dropped,
+                self.glyph_atlas.allocated_height(),
+                self.glyph_atlas.packed_count(),
+            );
+            self.overflow_rebuilds += 1;
+            self.invalidate_atlas();
+            frame_data = self.collect_frame_glyphs(&frame_layout, revision, opacity);
+            let still_dropped = self.glyph_atlas.take_dropped();
+            if still_dropped > 0 {
+                // 重建后仍装不下 = 单帧需求超过 atlas 硬上限，属于容量/密度问题，
+                // 得靠 max_lines / max_quantity 控制并发，不能靠重试解决。
+                self.unresolved_drops += still_dropped as u64;
+                if self.frame_count.is_multiple_of(300) {
+                    tracing::error!(
+                        "DanmakuEngine: atlas still overflowed after rebuild, {} glyph(s) \
+                         dropped for {} visible items — 单帧字形需求超过 atlas 容量上限，\
+                         需要限制并发弹幕数（max_lines / max_quantity）",
+                        still_dropped,
+                        frame_layout.items.len(),
+                    );
+                }
             }
         }
 
@@ -543,11 +673,13 @@ impl DanmakuEngine {
             && !frame_layout.items.is_empty()
             && self.frame_count.is_multiple_of(300)
         {
+            let font_loaded = self.font_data.as_ref().is_some();
             tracing::warn!(
                 "build_render_plan: {} visible items but rasterization produced 0 placements \
-                 (font_slice_len={})",
+                 (font_loaded={}, atlas_height={})",
                 frame_layout.items.len(),
-                font_slice.len(),
+                font_loaded,
+                self.glyph_atlas.allocated_height(),
             );
         }
 
@@ -559,14 +691,26 @@ impl DanmakuEngine {
         for fd in &frame_data {
             for placement in fd.placements.iter() {
                 if placement.packed.width == 0 || placement.packed.height == 0 {
+                    // 两类"零尺寸"要分开：
+                    // - `glyph.width == 0`：字体压根没有这个码位的轮廓（空格、
+                    //   缺字）。本来就没东西可画，跳过是正常的。
+                    // - `glyph.width > 0` 但塞不进 atlas：**真丢字形**，弹幕会缺字。
+                    //   上面的溢出重试就是为了消灭这一类；这里计数是最后一道防线。
+                    if placement.glyph.width > 0 && placement.glyph.height > 0 {
+                        self.missing_glyphs += 1;
+                    } else {
+                        self.empty_glyphs += 1;
+                    }
                     continue;
                 }
 
-                let glyph_x = fd.frame_item_x * scale_x
-                    + (placement.pen_x + placement.glyph.offset_x) * scale_x;
-                let glyph_y = fd.frame_item_y * scale_y + placement.glyph.offset_y * scale_y;
-                let glyph_w = placement.packed.width as f32 * scale_x;
-                let glyph_h = placement.packed.height as f32 * scale_y;
+                // 布局坐标即 surface 像素，只需补上字形在文本内的偏移。
+                // item.y 是绘制框顶边（DFM 语义），基线在框内约一个字号处。
+                let glyph_rect = glyph_rect_on_screen(
+                    fd.frame_item_x,
+                    fd.frame_item_y + fd.baseline_offset_y,
+                    placement,
+                );
 
                 let tex_rect = [
                     placement.packed.x as f32 / atlas_w,
@@ -579,14 +723,14 @@ impl DanmakuEngine {
                 // fill/outline bitmap 已统一为 outline 尺寸（含 dilation），
                 // 两者使用相同的 rect 和 tex_rect，outline 的 dilation 已在 bitmap 中
                 outline.push(GlyphInstance {
-                    rect: [glyph_x, glyph_y, glyph_w, glyph_h],
+                    rect: glyph_rect,
                     tex_rect,
                     color_rgba: [0.0, 0.0, 0.0, fd.color_rgba[3]],
                 });
 
                 // Fill draw（彩色填充）
                 fill.push(GlyphInstance {
-                    rect: [glyph_x, glyph_y, glyph_w, glyph_h],
+                    rect: glyph_rect,
                     tex_rect,
                     color_rgba: fd.color_rgba,
                 });
@@ -613,8 +757,7 @@ impl Overlay for DanmakuEngine {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         surface_format: wgpu::TextureFormat,
-        surface_width: u32,
-        surface_height: u32,
+        area: OverlayArea,
     ) {
         // 确保渲染管线就绪
         self.ensure_pipeline(device, surface_format);
@@ -639,8 +782,33 @@ impl Overlay for DanmakuEngine {
             return;
         }
 
-        // 自适应 viewport: 检测 surface 尺寸变化，触发 relayout
-        let viewport_changed = self.last_viewport != Some((surface_width, surface_height));
+        // 弹幕的布局与字号基准：**整个窗口（surface）**
+        //
+        // 刻意**不用** letterbox 之后的画面矩形：弹幕铺满播放器窗口，落在上下/左右
+        // 黑边里是正常且预期的（B 站播放器就是这样）。真按画面矩形排，竖屏手机播
+        // 16:9 视频时轨道数会从 ~60 掉到 ~16，overwriteInsert 于是频繁把**正在
+        // 屏幕上**的老弹幕挤掉 —— 表现为"弹幕刚出现就突然消失"；字号也会因为
+        // 改跟视频原生分辨率走而明显变小。
+        let (rect_w, rect_h) = (area.surface_width as f32, area.surface_height as f32);
+        let font_scale = font_scale_for(area.surface_height as f32);
+
+        // config 始终反映最新几何，这样之后 load_items 不会用旧值布局
+        self.config.viewport_width = rect_w;
+        self.config.viewport_height = rect_h;
+        self.config.font_scale = font_scale;
+
+        // 自适应窗口：surface 尺寸变化就重排
+        //
+        // 刻意**没有**节流，也没有"字号变了就整表作废 atlas"的分支：
+        // - 字号系数是 `surface_h / 1080` 这样的未取整浮点，surface 差 1px 就会变，
+        //   但真正决定字形尺寸的 `PreparedItem.font_size` 是 round 之后的整数
+        //   （25×2.16667=54.17 与 25×2.16759=54.19 同为 54）。按浮点判定会去清掉
+        //   一个完全可复用的 atlas，反而丢掉已经积累的字形覆盖。
+        // - 整表作废后本帧必须重新打包所有字形；而单帧的字形需求（轨道数 ×
+        //   文本长度）本来就装得下，作废只会让画面在"半成品 atlas"上反复抖动，
+        //   表现为弹幕时有时无、字形缺字。
+        // 历史行为是"重排 + 只清 rasterizer 缓存"，这里保持一致。
+        let viewport_changed = self.last_viewport != Some((rect_w, rect_h));
         if viewport_changed {
             let items_to_relayout: Option<Vec<DanmakuItem>> = {
                 let state = self.state.lock();
@@ -650,43 +818,47 @@ impl Overlay for DanmakuEngine {
                     None
                 }
             };
+
             if let Some(items) = items_to_relayout {
-                let new_w = surface_width as f32;
-                let new_h = surface_height as f32;
                 tracing::info!(
-                    "DanmakuEngine: viewport changed {:?} -> {}x{}, relayout {} items",
+                    "DanmakuEngine: surface changed {:?} -> {:.0}x{:.0}, relayout {} items \
+                     (font_scale {:.3})",
                     self.last_viewport,
-                    surface_width,
-                    surface_height,
-                    items.len()
+                    rect_w,
+                    rect_h,
+                    items.len(),
+                    font_scale
                 );
                 let (new_instances, new_prepared) =
-                    LayoutEngine::relayout(&items, new_w, new_h, &self.config);
+                    LayoutEngine::relayout(&items, rect_w, rect_h, &self.config);
+                // 按旧字号光栅化的位图全部作废；atlas 保留 —— 同字号的字形仍可直接复用
+                self.rasterizer.clear_cache();
                 tracing::info!(
-                    "DanmakuEngine: relayout produced {} instances, prepared {} items",
+                    "DanmakuEngine: relayout produced {} instances, prepared {} items, \
+                     font_scale={:.3}",
                     new_instances.len(),
-                    new_prepared.items.len()
+                    new_prepared.items.len(),
+                    font_scale
                 );
                 let mut state = self.state.lock();
                 state.instances = new_instances;
                 state.prepared = Some(new_prepared);
+                // placement_cache 按 revision 失效，这里 revision 自增即可让
+                // 所有旧字形放置被丢弃重算（字形 atlas 本身尺寸不变，可复用）
                 state.prepared_revision += 1;
             } else {
                 tracing::info!(
-                    "DanmakuEngine: viewport changed {:?} -> {}x{}, but no items to relayout",
-                    self.last_viewport,
-                    surface_width,
-                    surface_height
+                    "DanmakuEngine: surface changed to {:.0}x{:.0}, but no items to relayout",
+                    rect_w,
+                    rect_h
                 );
             }
-            self.config.viewport_width = surface_width as f32;
-            self.config.viewport_height = surface_height as f32;
-            self.last_viewport = Some((surface_width, surface_height));
+            self.last_viewport = Some((rect_w, rect_h));
         }
 
         // Phase 2: 构建渲染计划（CPU 工作：frame query + rasterize + atlas pack）
-        // 布局已在实际像素坐标中完成，无需缩放
-        let plan = self.build_render_plan_internal(current_pts, 1.0, 1.0);
+        // 布局已完成在 surface 像素坐标里，无需偏移或缩放
+        let plan = self.build_render_plan_internal(current_pts);
 
         if plan.is_empty() {
             // 每 300 帧输出一次诊断：为什么 plan 为空
@@ -742,36 +914,16 @@ impl Overlay for DanmakuEngine {
         };
         if needs_upload {
             let snapshot = atlas.clone();
-            let ft = create_r8_texture(
-                device,
-                snapshot.width,
-                snapshot.height,
-                &[],
-                snapshot.stride,
-            );
-            let ot = create_r8_texture(
-                device,
-                snapshot.width,
-                snapshot.height,
-                &[],
-                snapshot.stride,
-            );
-            upload_r8_texture(
-                queue,
-                &ft,
-                &snapshot.fill_alpha,
-                snapshot.width,
-                snapshot.height,
-                snapshot.stride,
-            );
-            upload_r8_texture(
-                queue,
-                &ot,
-                &snapshot.outline_alpha,
-                snapshot.width,
-                snapshot.height,
-                snapshot.stride,
-            );
+            // ATLAS_WIDTH = 2048 正好是 GLES 的 max_texture_dimension_2d 下限，
+            // glyph_atlas 侧已经保证高度不会涨过它。请求的 limits 只会更高，
+            // 所以这里尺寸直接用快照值即可；额外夹一次只是防御。
+            let max_dim = device.limits().max_texture_dimension_2d;
+            let w = snapshot.width.clamp(1, max_dim);
+            let h = snapshot.height.clamp(1, max_dim);
+            let ft = create_r8_texture(device, w, h, &[], snapshot.stride);
+            let ot = create_r8_texture(device, w, h, &[], snapshot.stride);
+            upload_r8_texture(queue, &ft, &snapshot.fill_alpha, w, h, snapshot.stride);
+            upload_r8_texture(queue, &ot, &snapshot.outline_alpha, w, h, snapshot.stride);
             self.atlas_cache = Some(AtlasGpuCache {
                 version: snapshot.version,
                 fill_texture: ft,
@@ -862,7 +1014,9 @@ impl Overlay for DanmakuEngine {
             &cache.uniform_buffer,
             0,
             bytemuck::bytes_of(&FrameUniformData {
-                viewport: [surface_width as f32, surface_height as f32],
+                // 必须是**整个 surface** 的尺寸：shader 拿它做"像素 → NDC"，
+                // 而实例里的坐标已经是含 letterbox 偏移的 surface 像素
+                viewport: [area.surface_width as f32, area.surface_height as f32],
                 _pad: [0.0; 2],
             }),
         );
@@ -1050,6 +1204,7 @@ fn upload_r8_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glyph_atlas::{PackedGlyph, RasterizedGlyph, TextGlyphPlacement};
 
     fn glyph(x: f32) -> GlyphInstance {
         GlyphInstance {
@@ -1057,6 +1212,55 @@ mod tests {
             tex_rect: [0.0, 0.0, 1.0, 1.0],
             color_rgba: [1.0, 1.0, 1.0, 1.0],
         }
+    }
+
+    fn placement(w: u32, h: u32) -> TextGlyphPlacement {
+        TextGlyphPlacement {
+            glyph: Arc::new(RasterizedGlyph {
+                width: w,
+                height: h,
+                stride: w as usize,
+                fill_alpha: vec![0u8; (w * h) as usize],
+                outline_alpha: vec![0u8; (w * h) as usize],
+                offset_x: 1.0,
+                offset_y: 2.0,
+                advance: w as f32,
+            }),
+            packed: PackedGlyph {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            pen_x: 10.0,
+        }
+    }
+
+    /// 字形必须按位图原尺寸上屏，且只被字形自身偏移平移
+    ///
+    /// 防回归：这里曾经有 `scale_x/scale_y` 两个恒为 1.0 的缩放参数。一旦被填上
+    /// 非 1 的值（或两轴不等），弹幕字形就会横向压扁 / 纵向拉长。
+    #[test]
+    fn glyph_is_drawn_one_to_one() {
+        let p = placement(20, 24);
+        let r = glyph_rect_on_screen(100.0, 50.0, &p);
+        assert_eq!(r, [100.0 + 10.0 + 1.0, 50.0 + 2.0, 20.0, 24.0]);
+        // 宽高比必须严格保持
+        assert_eq!(r[2] / r[3], 20.0 / 24.0);
+    }
+
+    /// 弹幕铺满整个窗口：窗口变大时**位置**跟着走，但**字形尺寸**不变
+    ///
+    /// 字号随窗口高度变（内容基准那套只适用于字幕），但同一帧内位图必须
+    /// 按原尺寸绘制 —— 布局阶段已经把字号算进 `paint_width`/`font_size` 了。
+    #[test]
+    fn glyph_size_is_independent_of_viewport_size() {
+        let p = placement(20, 24);
+        // 同一个字形位图，放在窗口的不同位置
+        let small = glyph_rect_on_screen(10.0, 10.0, &p);
+        let large = glyph_rect_on_screen(1900.0, 500.0, &p);
+        assert_eq!(small[2], large[2], "字形宽度不得变化");
+        assert_eq!(small[3], large[3], "字形高度不得变化");
     }
 
     #[test]
@@ -1097,5 +1301,268 @@ mod tests {
         assert_eq!(instance_capacity_for(512, 512), 512);
         assert_eq!(instance_capacity_for(512, 600), 1024);
         assert_eq!(instance_capacity_for(512, 2000), 2000);
+    }
+
+    // ─── 真实弹幕文件回归测试 ──────────────────────────────────────
+
+    /// 载入仓库根目录的实测弹幕文件（缺失时跳过，保证 CI 仍能跑）
+    fn real_danmaku_file() -> Option<std::path::PathBuf> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../鱿鱼游戏_第一季_E229237.xml");
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    /// 从系统载入一个可用的中文字体（缺字体时返回 None 让测试跳过）
+    fn test_font() -> Option<Vec<u8>> {
+        let fonts_dir = std::env::var("WINDIR")
+            .map(|w| format!("{w}\\Fonts"))
+            .unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
+        for name in ["msyh.ttc", "simhei.ttf", "simsun.ttc", "segoeui.ttf"] {
+            let p = std::path::Path::new(&fonts_dir).join(name);
+            if let Ok(data) = std::fs::read(&p) {
+                return Some(
+                    raptor_render::font_util::extract_ttc_preferred(
+                        &data,
+                        raptor_render::font_util::CJK_SC_PREFER,
+                    )
+                    .map(|f| f.data)
+                    .unwrap_or(data),
+                );
+            }
+        }
+        None
+    }
+
+    /// 把引擎摆到"给定的窗口尺寸 + 给定视频时长"的状态（不碰 GPU）
+    fn engine_at(surface: (u32, u32), xml: &std::path::Path) -> DanmakuEngine {
+        let mut engine = DanmakuEngine::new(DanmakuConfig::default());
+        engine.config.viewport_width = surface.0 as f32;
+        engine.config.viewport_height = surface.1 as f32;
+        engine.config.font_scale = font_scale_for(surface.1 as f32);
+        // 标记为"已建立过布局"，避免测试里再触发 relayout
+        engine.last_viewport = Some((surface.0 as f32, surface.1 as f32));
+        engine
+            .load_from_file(xml.to_str().expect("utf-8 path"))
+            .expect("弹幕文件应能加载");
+        engine
+    }
+
+    /// 真实弹幕文件全时间轴回放：**任何一帧都不能丢字形**
+    ///
+    /// 这条测试直接对应用户报的「滚动弹幕出现不到一秒就没了 + 显示不全」。
+    /// 根因链：atlas 高度硬封顶 2048 → `pack()` 装不下时返回零尺寸 → Phase 3
+    /// 跳过绘制 → 字形缺失；而零尺寸结果还会被 `placement_cache` 粘住不放。
+    ///
+    /// 该文件 9964 条弹幕、峰值并发 147 条（8 秒窗口），且字符集很大，正好能把
+    /// atlas 撑爆，是这个 bug 的理想复现样本。修复靠"溢出后整表重建并重试"，
+    /// 所以断言 `unresolved_drops() == 0`。
+    #[test]
+    fn real_xml_timeline_never_loses_glyphs() {
+        let (Some(xml), Some(font)) = (real_danmaku_file(), test_font()) else {
+            eprintln!("skip: 缺少弹幕文件或系统字体");
+            return;
+        };
+
+        // 手机竖屏：1080x2340，字号系数 2.167，字形最大 —— 最容易撞容量上限
+        let mut engine = engine_at((1080, 2340), &xml);
+        engine.set_font(font);
+
+        let mut peak_visible = 0usize;
+        let mut peak_at = 0.0f64;
+        let mut frames_with_glyphs = 0usize;
+        let mut total_visible = 0usize;
+
+        // 15fps 走完全片（3394s），足以覆盖滚动弹幕的整个生命周期
+        let mut t = 0.0f64;
+        while t <= 3400.0 {
+            engine.frame_count += 1;
+            let plan = engine.build_render_plan_internal(t);
+            let visible = plan.fill.len() / 2; // outline + fill 数量相同
+            total_visible += visible;
+            if visible > peak_visible {
+                peak_visible = visible;
+                peak_at = t;
+            }
+            if visible > 0 {
+                frames_with_glyphs += 1;
+                // 每条可见弹幕至少要有一个可绘制字形，否则就是"显示不全"
+                assert_eq!(
+                    plan.fill.len(),
+                    plan.outline.len(),
+                    "t={t:.1}: outline/fill 实例数必须一致"
+                );
+            }
+            t += 1.0 / 15.0;
+        }
+
+        println!(
+            "real_xml_timeline_never_loses_glyphs: frames={:.0} peak_glyphs={} at t={:.1}s \
+             total_visible={} rebuilds={} unresolved={} missing={} empty={} atlas_h={} kinds={}",
+            t * 15.0,
+            peak_visible,
+            peak_at,
+            total_visible,
+            engine.overflow_rebuilds(),
+            engine.unresolved_drops(),
+            engine.missing_glyphs(),
+            engine.empty_glyphs(),
+            engine.glyph_atlas.allocated_height(),
+            engine.glyph_atlas.packed_count(),
+        );
+
+        assert!(
+            frames_with_glyphs > 0,
+            "整条时间轴一条弹幕都没画出来 —— 解析或布局出了问题"
+        );
+        assert!(
+            peak_visible >= 20,
+            "峰值同屏字形数只有 {peak_visible}，明显偏少（布局把大部分弹幕挤掉了）"
+        );
+        assert_eq!(
+            engine.unresolved_drops(),
+            0,
+            "有 {} 个字形在 atlas 重建后仍被丢弃 —— 弹幕会显示不全。\
+             单帧字形需求超过了 atlas 容量上限，需要限制并发弹幕数",
+            engine.unresolved_drops()
+        );
+        assert_eq!(
+            engine.missing_glyphs(),
+            0,
+            "整条时间轴共 {} 个字形没能绘制（atlas 装不下）—— 这就是「弹幕显示不全 / \
+             一闪就没」的直接原因",
+            engine.missing_glyphs()
+        );
+    }
+
+    /// 字体必须覆盖弹幕里出现的所有字符（否则弹幕会缺字，且不报错）
+    ///
+    /// `empty_glyphs` 统计的是"光栅化出零尺寸位图"的字形，绝大多数是空格（正常），
+    /// 但如果混进了真正的汉字/字母/标点，就意味着字体缺字，弹幕会安静地少字 ——
+    /// 与 atlas 溢出表现完全一样，但根因完全不同。这条测试把两者分开。
+    #[test]
+    fn real_xml_characters_are_all_covered_by_the_font() {
+        let (Some(xml), Some(font)) = (real_danmaku_file(), test_font()) else {
+            return;
+        };
+        let data = std::fs::read(&xml).expect("read xml");
+        let items = crate::parser::parser_for_extension("xml").parse(&data);
+
+        let font_ref = ab_glyph::FontRef::try_from_slice(&font).expect("font parses");
+        use ab_glyph::{Font, ScaleFont};
+        let scaled = font_ref.as_scaled(ab_glyph::PxScale::from(25.0f32));
+
+        let mut checked = 0usize;
+        let mut missing: std::collections::BTreeMap<char, usize> = Default::default();
+        for item in &items {
+            for ch in item.text.chars() {
+                checked += 1;
+                if ch.is_whitespace() {
+                    continue;
+                }
+                let glyph_id = scaled.glyph_id(ch);
+                let empty = scaled
+                    .outline_glyph(scaled.scaled_glyph(ch))
+                    .map(|g| {
+                        let b = g.px_bounds();
+                        b.width() <= 0.0 || b.height() <= 0.0
+                    })
+                    .unwrap_or(true);
+                if empty && glyph_id.0 != 0 {
+                    *missing.entry(ch).or_default() += 1;
+                }
+            }
+        }
+
+        assert!(checked > 0, "应解析出弹幕文本");
+        if !missing.is_empty() {
+            let sample: Vec<String> = missing
+                .iter()
+                .take(20)
+                .map(|(c, n)| format!("{c:?}×{n}"))
+                .collect();
+            panic!(
+                "字体缺少 {} 种字符（共出现 {} 次），弹幕会安静地缺字：{}",
+                missing.len(),
+                missing.values().sum::<usize>(),
+                sample.join(" ")
+            );
+        }
+    }
+
+    /// 滚动弹幕必须按 `scroll_duration` 走完全程（不能"一闪而过"）
+    ///
+    /// 用户报的现象是「滚动弹幕出现不到一秒就没了」。这条测试直接量生命周期：
+    /// 采样 x(t)，断言弹幕从出现到完全离屏耗时接近 `scroll_duration`，且中间
+    /// 单调推进、没有跳变。行程 = 窗口宽 + 文本宽（起点在右边缘，终点在左侧文本外）。
+    #[test]
+    fn real_xml_scroll_lifetime_matches_duration() {
+        let Some(xml) = real_danmaku_file() else {
+            return;
+        };
+        let surface = 1920.0f32;
+        let engine = engine_at((surface as u32, 1080), &xml);
+        let state = engine.state.lock();
+        let prepared = state.prepared.as_ref().expect("prepared");
+
+        let mut checked = 0usize;
+        for item in prepared.items.iter() {
+            if !item.is_scroll {
+                continue;
+            }
+            checked += 1;
+            if checked > 300 {
+                break;
+            }
+
+            let duration = item.end_time - item.start_time;
+            assert!(
+                (duration - 8.0).abs() < 0.01,
+                "滚动时长应恒为 scroll_duration=8s，实际 {duration}"
+            );
+
+            // 起点在窗口右边缘，终点在窗口左侧、文本宽度之外
+            assert!(
+                (item.start_x - surface).abs() < 1.0,
+                "起点应等于窗口宽 {surface}，实际 {}",
+                item.start_x
+            );
+            assert!(
+                item.text_width > 0.0,
+                "text_width 不能为 0，否则弹幕行程只剩窗口宽"
+            );
+            assert!(
+                (item.end_x + item.text_width).abs() < 1.0,
+                "终点应等于 -text_width（{}），实际 {}",
+                -item.text_width,
+                item.end_x
+            );
+
+            // 采样整条生命周期：x 必须单调递减
+            let mut prev_x = f32::INFINITY;
+            for step in 0..=40 {
+                let t = item.start_time + duration * (step as f64 / 40.0);
+                let x = item.x_at(t);
+                assert!(
+                    x <= prev_x + 0.5,
+                    "t={t:.2} 处 x={x} 反而比上一个采样点 {prev_x} 大 —— 运动不单调"
+                );
+                prev_x = x;
+            }
+
+            // 从"完全离屏"到"完全入屏"的可见时长应接近 scroll_duration。
+            // 弹幕中心 x 落在 [-text_width, surface] 区间内的时长就是可见时长。
+            let visible_start = item.start_time;
+            let visible_end = item.start_time + duration;
+            assert!(
+                visible_end - visible_start > 4.0,
+                "可见时长 {}s 过短，看起来就是一闪而过",
+                visible_end - visible_start
+            );
+        }
+        assert!(checked > 0, "文件里应有滚动弹幕");
     }
 }

@@ -263,11 +263,24 @@ class RaptorBindings {
     return RaptorBindings._(DynamicLibrary.process());
   }
 
+  /// The library name must match what cargo emits for the `[lib]` name in
+  /// crates/raptor-ffi/Cargo.toml:
+  ///
+  /// | platform   | crate-type  | emitted file         |
+  /// |------------|-------------|----------------------|
+  /// | Windows    | cdylib      | `raptor_ffi.dll`     |
+  /// | macOS      | cdylib      | `libraptor_ffi.dylib`|
+  /// | Linux      | cdylib      | `libraptor_ffi.so`   |
+  /// | Android    | cdylib      | `libraptor_ffi.so`   |
+  ///
+  /// The Android entry used to say `libraptor.so`, which is the name cargo
+  /// derives from the *package* name (`raptor-ffi`) only if the lib target
+  /// were renamed -- so `DynamicLibrary.open` threw at startup.
   static String _defaultLibPath() {
     if (Platform.isWindows) return 'raptor_ffi.dll';
-    if (Platform.isMacOS) return 'libraptor.dylib';
-    if (Platform.isLinux) return 'libraptor.so';
-    if (Platform.isAndroid) return 'libraptor.so';
+    if (Platform.isMacOS) return 'libraptor_ffi.dylib';
+    if (Platform.isLinux) return 'libraptor_ffi.so';
+    if (Platform.isAndroid) return 'libraptor_ffi.so';
     if (Platform.isIOS) return 'RaptorPlayer'; // framework
     throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
   }

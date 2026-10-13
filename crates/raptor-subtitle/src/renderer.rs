@@ -12,8 +12,9 @@ use crate::ass::{eval_fade, eval_move, Alignment, AssEvent, AssStyle, AssTags};
 use crate::types::{SubtitleConfig, SubtitleEvent};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use parking_lot::Mutex;
-use raptor_render::Overlay;
-use std::collections::HashMap;
+use raptor_render::font_util::{extract_ttc_preferred, CJK_SC_PREFER};
+use raptor_render::{Overlay, OverlayArea};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// 单帧最多渲染的字幕条数（也等于 alpha uniform 的槽位数）
@@ -24,6 +25,12 @@ use std::sync::Arc;
 const MAX_ITEMS: usize = 128;
 /// uniform 槽位间隔（min_uniform_buffer_offset_alignment）
 const UNIFORM_SLOT: u64 = 256;
+
+/// 字幕位图缓存容量（张）
+///
+/// 一条长台词的光栅化位图可达 2000×2000，缓存必须有界，否则长时间播放会一路
+/// 涨到 OOM。超出后按 FIFO 淘汰，本帧仍在用的条目不动。
+const TEXTURE_CACHE_CAPACITY: usize = 192;
 
 /// 字幕状态 — 由外部线程写入，渲染线程读取
 pub struct SubtitleState {
@@ -82,6 +89,9 @@ pub struct SubtitleEngine {
     font_data: Option<Vec<u8>>,
     /// 缓存的纹理（key = 文本+字号+颜色哈希）
     texture_cache: HashMap<u64, CachedTexture>,
+    /// `texture_cache` 的插入顺序（FIFO 近似 LRU）：本帧用到的 key 会被挪到末尾，
+    /// 超出容量时从头淘汰
+    texture_order: VecDeque<u64>,
     /// 本帧活跃字幕的求值结果（update 写入，render 读取）
     active_items: Vec<RenderItem>,
     /// wgpu 渲染管线（惰性初始化）
@@ -113,6 +123,7 @@ impl SubtitleEngine {
             config,
             font_data: None,
             texture_cache: HashMap::new(),
+            texture_order: VecDeque::new(),
             active_items: Vec::new(),
             render_pipeline: None,
             bind_group_layout: None,
@@ -125,21 +136,22 @@ impl SubtitleEngine {
 
     /// 设置字体数据（支持 TTF/OTF/TTC 格式）
     pub fn set_font(&mut self, font_data: Vec<u8>) {
-        let font_data = if font_data.len() >= 16 && &font_data[0..4] == b"ttcf" {
-            // TTC: 提取第一个字体并重写 offset 表；直接切片会导致 ab_glyph 解析失败
-            let offset = u32::from_be_bytes(font_data[12..16].try_into().unwrap()) as usize;
-            match raptor_render::extract_font_from_ttc(&font_data, offset) {
-                Some(extracted) => {
-                    tracing::info!("SubtitleEngine: TTC font extracted from offset {offset}");
-                    extracted
-                }
-                None => font_data,
+        // 调用方通常已经递过来单字体（load_system_font 会挑好 face）；这里是
+        // 直接喂 TTC 时的兜底，同样按 SC 优先而不是死取 face #0。
+        let font_data = match extract_ttc_preferred(&font_data, CJK_SC_PREFER) {
+            Some(face) => {
+                tracing::info!(
+                    "SubtitleEngine: TTC face #{} '{}' extracted",
+                    face.index,
+                    face.family
+                );
+                face.data
             }
-        } else {
-            font_data
+            None => font_data,
         };
         self.font_data = Some(font_data);
         self.texture_cache.clear();
+        self.texture_order.clear();
     }
 
     fn make_font(&self) -> Option<FontRef<'_>> {
@@ -454,8 +466,14 @@ impl SubtitleEngine {
         self.surface_format = Some(surface_format);
     }
 
-    /// 缓存 key：文本 + 字号 + 颜色
-    fn item_hash(item: &RenderItem) -> u64 {
+    /// 缓存 key：文本 + 字号 + 颜色 + 画布尺寸 + 字号系数
+    ///
+    /// 最后一项是**光栅化用的字号系数**（内容基准，见 [OverlayArea::content_scale]）：
+    /// 同样一句话在不同系数下光栅出的位图尺寸不同，所以必须参与。
+    ///
+    /// 刻意**不含** surface 尺寸：字号改成内容基准后，位图只跟视频原生分辨率有关，
+    /// 拖窗口 / 旋转屏幕 / 分屏都不会让这句话的位图失效，缓存因此可以跨 resize 复用。
+    fn item_hash(item: &RenderItem, font_scale: f32) -> u64 {
         let mut hash: u64 = 5381;
         for byte in item.text.bytes() {
             hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
@@ -465,6 +483,9 @@ impl SubtitleEngine {
             item.colour[0].to_bits(),
             item.colour[1].to_bits(),
             item.colour[2].to_bits(),
+            item.canvas.0.to_bits(),
+            item.canvas.1.to_bits(),
+            font_scale.to_bits(),
         ] {
             hash = hash.wrapping_mul(31).wrapping_add(bits as u64);
         }
@@ -472,35 +493,69 @@ impl SubtitleEngine {
     }
 
     /// 渲染文本为 RGBA bitmap（指定字号与颜色）
-    fn rasterize_text(&self, item: &RenderItem) -> Option<(Vec<u8>, u32, u32)> {
+    ///
+    /// [max_dim] 是设备允许的最大纹理边长（`max_texture_dimension_2d`）。
+    /// 字幕字号来自 ASS 的 `\fs`，不受播放器控制：一条长台词在 1920x1080 的
+    /// PlayRes 上按 fs=40 排出来轻易就是 3500+ 像素宽，而 GLES 后端的
+    /// downlevel 上限只有 2048。硬建纹理会被 wgpu 判为 validation 错误，
+    /// 进而让整帧的 bind group / submit 全部失效（黑屏，历史上直接 abort）。
+    ///
+    /// 所以这里先按可用边长反推一个缩放系数再光栅化。文字仍然按锚点落在画面矩形里
+    /// 该落的位置（`render()` 用位置映射算 viewport），只是采样分辨率降低 ——
+    /// 糊一点，远好过整条字幕画不出来。
+    fn rasterize_text(
+        &self,
+        item: &RenderItem,
+        font_scale: f32,
+        max_dim: u32,
+    ) -> Option<(Vec<u8>, u32, u32)> {
         let font = self.make_font()?;
-
-        let scale = PxScale::from(item.font_size);
-        let scaled_font = font.as_scaled(scale);
-        let ascent = scaled_font.ascent();
-
-        // 按行处理（ab_glyph 的 descent 为负值，行高 = ascent - descent）
         let lines: Vec<&str> = item.text.lines().collect();
-        let line_height = ascent - scaled_font.descent() + 4.0;
-
-        let mut max_width = 0.0f32;
-        let mut line_glyphs: Vec<Vec<(ab_glyph::Glyph, f32)>> = Vec::new();
-
-        for line in &lines {
-            let mut width = 0.0f32;
-            let mut glyphs = Vec::new();
-            for ch in line.chars() {
-                let glyph = scaled_font.scaled_glyph(ch);
-                let advance = scaled_font.h_advance(glyph.id);
-                glyphs.push((glyph, width));
-                width += advance;
-            }
-            max_width = max_width.max(width);
-            line_glyphs.push(glyphs);
+        if lines.is_empty() {
+            return None;
         }
 
-        let width_px = max_width.ceil() as u32 + 8; // 4px padding each side
-        let height_px = (line_height * lines.len() as f32).ceil() as u32 + 8;
+        // ASS 的 \fs 是画布像素，乘上**内容基准**系数才是实际绘制像素。
+        // 这个系数只跟视频原生分辨率有关，所以位图在拖窗口、旋转、分屏时都不会
+        // 失效 —— 缓存 key 里也只放它，不放 surface 尺寸。
+        let px_size = (item.font_size * font_scale).max(1.0);
+
+        // 预算：每行 4px padding 已在下面统一加上，这里先算纯文本尺寸
+        let budget = max_dim.saturating_sub(8).max(1) as f32;
+
+        let layout = |scale_px: f32| {
+            let scaled_font = font.as_scaled(PxScale::from(scale_px));
+            let line_height = scaled_font.ascent() - scaled_font.descent() + 4.0;
+            let mut max_width = 0.0f32;
+            let mut line_glyphs: Vec<Vec<(ab_glyph::Glyph, f32)>> = Vec::new();
+            for line in &lines {
+                let mut width = 0.0f32;
+                let mut glyphs = Vec::new();
+                for ch in line.chars() {
+                    let glyph = scaled_font.scaled_glyph(ch);
+                    let advance = scaled_font.h_advance(glyph.id);
+                    glyphs.push((glyph, width));
+                    width += advance;
+                }
+                max_width = max_width.max(width);
+                line_glyphs.push(glyphs);
+            }
+            (scaled_font, line_height, max_width, line_glyphs)
+        };
+
+        // 先按目标字号量一次，只有超限才回退（避免误伤正常字号）
+        let (scaled_font, line_height, max_width, line_glyphs) = layout(px_size);
+        let overshoot = (max_width.max(line_height * lines.len() as f32)) / budget;
+        let (scaled_font, line_height, max_width, line_glyphs) = if overshoot > 1.0 {
+            layout(px_size / overshoot)
+        } else {
+            (scaled_font, line_height, max_width, line_glyphs)
+        };
+
+        let ascent = scaled_font.ascent();
+        let width_px = (max_width.ceil() as u32).min(max_dim).max(1) + 0;
+        let width_px = width_px.min(max_dim);
+        let height_px = ((line_height * lines.len() as f32).ceil() as u32).min(max_dim);
 
         if width_px == 0 || height_px == 0 {
             return None;
@@ -639,14 +694,16 @@ impl Overlay for SubtitleEngine {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         surface_format: wgpu::TextureFormat,
-        surface_width: u32,
-        surface_height: u32,
+        area: OverlayArea,
     ) {
         if self.active_items.is_empty() {
             return;
         }
 
         self.ensure_pipeline(device, surface_format);
+
+        // 单条字幕纹理不能超过这个边长，超了就是 validation 错误（见 rasterize_text）
+        let max_dim = device.limits().max_texture_dimension_2d;
 
         let (pipeline, bg_layout, sampler, alpha_buffer) = match (
             &self.render_pipeline,
@@ -659,22 +716,51 @@ impl Overlay for SubtitleEngine {
         };
 
         let items = std::mem::take(&mut self.active_items);
+        let (_rect_x, _rect_y, rect_w, rect_h) = area.video_rect;
 
-        // 本帧用到的纹理 key 集合：缓存超限时只淘汰不再使用的条目，
-        // 避免整表清空导致高密度弹幕下每帧全量重新光栅化
-        let used_hashes: std::collections::HashSet<u64> =
-            items.iter().map(Self::item_hash).collect();
+        // ── 两条缩放链刻意分开 ──────────────────────────────────────
+        //
+        // `pos_scale`：画布（ASS PlayRes）→ 画面矩形的仿射映射。位置必须跟着
+        //   画面走（pillarbox 时才能贴住视频而不是黑边）。
+        // `font_scale`：光栅化时的实际像素字号，**只跟视频原生分辨率有关**
+        //   （见 OverlayArea::content_scale）。拖窗口 / 旋转 / 分屏时它不变，
+        //   于是文字的物理大小保持恒定，缓存也不会被打掉。
+        //
+        // 位图按 font_scale 光栅化后**原尺寸 1:1 上屏**，绝不能再乘 pos_scale：
+        // 那样会让同一个系数同时作用于位置和尺寸，长句在窗口变大时字反而变小。
+        let pos_scale_of = |item: &RenderItem| {
+            uniform_canvas_scale(item.canvas.0, item.canvas.1, rect_w as u32, rect_h as u32)
+        };
+        let font_scale_of = |item: &RenderItem| {
+            let s = area.content_scale(item.canvas.1);
+            if s.is_finite() && s > 0.0 {
+                s
+            } else {
+                1.0
+            }
+        };
+
+        let hash_of = |item: &RenderItem| Self::item_hash(item, font_scale_of(item));
+
+        // 本帧用到的纹理 key 集合：本帧在用的条目永不淘汰
+        let used_hashes: HashSet<u64> = items.iter().map(&hash_of).collect();
 
         let mut prepared: Vec<(u64, f32)> = Vec::with_capacity(items.len());
         for item in &items {
-            let hash = Self::item_hash(item);
+            let hash = hash_of(item);
             if !self.texture_cache.contains_key(&hash) {
-                if let Some((pixels, w, h)) = self.rasterize_text(item) {
+                if let Some((pixels, w, h)) =
+                    self.rasterize_text(item, font_scale_of(item), max_dim)
+                {
                     let texture = device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("subtitle_text"),
                         size: wgpu::Extent3d {
-                            width: w.max(1),
-                            height: h.max(1),
+                            // rasterize_text 已经按 max_dim 夹过了，这里再兜一层：
+                            // 纹理一旦超限，wgpu 报的是 validation 错误而非本地 panic，
+                            // 而 validation 错误会污染整条命令缓冲（后续 bind group、
+                            // submit 全部失败），代价远大于丢掉这一条字幕。
+                            width: w.clamp(1, max_dim),
+                            height: h.clamp(1, max_dim),
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
@@ -694,18 +780,19 @@ impl Overlay for SubtitleEngine {
                         &pixels,
                         wgpu::TexelCopyBufferLayout {
                             offset: 0,
-                            bytes_per_row: Some(w * 4),
-                            rows_per_image: Some(h),
+                            // 上传尺寸必须和上面 clamp 后的纹理尺寸完全一致，
+                            // 否则 wgpu 会因为数据量对不上而报 validation 错误
+                            bytes_per_row: Some(w.clamp(1, max_dim) * 4),
+                            rows_per_image: Some(h.clamp(1, max_dim)),
                         },
                         wgpu::Extent3d {
-                            width: w,
-                            height: h,
+                            width: w.clamp(1, max_dim),
+                            height: h.clamp(1, max_dim),
                             depth_or_array_layers: 1,
                         },
                     );
-                    if self.texture_cache.len() > 256 {
-                        self.texture_cache.retain(|k, _| used_hashes.contains(k));
-                    }
+                    // 只登记插入顺序，淘汰统一放在本帧 item 处理完之后
+                    self.texture_order.push_back(hash);
                     self.texture_cache.insert(
                         hash,
                         CachedTexture {
@@ -718,6 +805,32 @@ impl Overlay for SubtitleEngine {
             }
             let mult = item.alpha * item.colour[3];
             prepared.push((hash, mult));
+        }
+
+        // 本帧在用的条目刷到顺序末尾，再从头部淘汰直到回到容量上限。
+        // 旧实现只在"新建纹理且 len > 256"时整表 retain：拖窗口期间每帧都要为每个
+        // 活跃条目新建纹理，缓存表持续churn，而上限本身其实靠得住 —— 换成真正的
+        // 容量裁剪后，既不再整表清空，也不会让长期播放的会话无限增长。
+        self.texture_order
+            .retain(|k| self.texture_cache.contains_key(k));
+        for hash in &used_hashes {
+            if let Some(pos) = self.texture_order.iter().position(|k| k == hash) {
+                let k = self.texture_order.remove(pos).expect("position 刚取到");
+                self.texture_order.push_back(k);
+            }
+        }
+        while self.texture_order.len() > TEXTURE_CACHE_CAPACITY {
+            match self.texture_order.pop_front() {
+                Some(k) if !used_hashes.contains(&k) => {
+                    self.texture_cache.remove(&k);
+                }
+                Some(k) => {
+                    // 本帧还在用，不能丢；挪到末尾等下一帧再淘汰
+                    self.texture_order.push_back(k);
+                    break;
+                }
+                None => break,
+            }
         }
 
         // 一个 render pass 内逐 item 切换 viewport + bind group
@@ -742,23 +855,23 @@ impl Overlay for SubtitleEngine {
                 continue;
             };
 
-            // 画布坐标 → 表面像素
-            let scale_x = surface_width as f32 / item.canvas.0;
-            let scale_y = surface_height as f32 / item.canvas.1;
-            let tex_w = cached.width as f32 * scale_x;
-            let tex_h = cached.height as f32 * scale_y;
-            let ax = item.anchor.0 * scale_x;
-            let ay = item.anchor.1 * scale_y;
-            let x = match item.align.h() {
-                0 => ax,
-                1 => ax - tex_w / 2.0,
-                _ => ax - tex_w,
-            };
-            let y = match item.align.v() {
-                0 => ay - tex_h,
-                1 => ay - tex_h / 2.0,
-                _ => ay,
-            };
+            // 画布坐标 → 画面矩形内的像素 → surface 像素
+            //
+            // 位置用 `pos_scale`（等比，取两轴较小值）：ASS 的 PlayRes 通常是
+            // 1920x1080，而画面矩形可能是 1080x608 的横条。x/y 各自缩放会把 16:9
+            // 的字幕横向压扁 —— 字形变形就是这么来的。
+            //
+            // 尺寸**不**用 pos_scale：位图已经按内容基准的字号光栅化好了，
+            // 按原尺寸 1:1 放置即可（`tex_w/tex_h` 直接取缓存尺寸）。这样
+            // 拖窗口时位置自适应而字形大小恒定，两者互不干扰。
+            let pos_scale = pos_scale_of(item);
+            let (x, y, tex_w, tex_h) = subtitle_placement(
+                item,
+                area.video_rect,
+                pos_scale,
+                cached.width as f32,
+                cached.height as f32,
+            );
 
             // alpha 写入本 slot 的 uniform 区间
             let offset = (slot as u64) * UNIFORM_SLOT;
@@ -804,6 +917,56 @@ impl Overlay for SubtitleEngine {
     }
 }
 
+/// 等比**位置**映射系数（contain）：取两轴较小值，保证画布完整放进目标矩形且不变形
+///
+/// 分开按 x/y 缩放是字幕在竖屏上被压扁的直接原因 —— 1920x1080 的 PlayRes
+/// 映射到窄条画面时，x 方向要缩 0.56、y 方向要缩 1.37，比例失守。
+///
+/// 只用于**位置**。字号走 [`raptor_render::OverlayArea::content_scale`]（内容基准），
+/// 两者刻意分开：位置跟画面走，字号跟内容走。
+pub fn uniform_canvas_scale(canvas_w: f32, canvas_h: f32, target_w: u32, target_h: u32) -> f32 {
+    if canvas_w <= 0.0 || canvas_h <= 0.0 || target_w == 0 || target_h == 0 {
+        return 1.0;
+    }
+    (target_w as f32 / canvas_w).min(target_h as f32 / canvas_h)
+}
+
+/// 一条字幕的上屏矩形（surface 像素，左上角 + 宽高）
+///
+/// 这里刻意把**位置**与**尺寸**分成两个互不相干的输入：
+///
+/// - `pos_scale`：画布（ASS PlayRes）→ 画面矩形的等比映射，**随窗口变化**。
+///   位置必须跟着画面走，pillarbox 时才能贴住视频而不是黑边。
+/// - `tex_w/tex_h`：位图尺寸，光栅化时已按**内容基准**字号算好，**随窗口不变**。
+///   直接原样使用，绝不再乘 `pos_scale` —— 否则同一个系数会同时作用于位置和
+///   尺寸，窗口一变长句的字号反而跟着变。
+pub(crate) fn subtitle_placement(
+    item: &RenderItem,
+    rect: (f32, f32, f32, f32),
+    pos_scale: f32,
+    tex_w: f32,
+    tex_h: f32,
+) -> (f32, f32, f32, f32) {
+    let (rx, ry, rw, rh) = rect;
+    // contain：等比映射后可能有一侧留白，需要在画面矩形内居中
+    let offset_x = rx + (rw - item.canvas.0 * pos_scale) / 2.0;
+    let offset_y = ry + (rh - item.canvas.1 * pos_scale) / 2.0;
+
+    let ax = offset_x + item.anchor.0 * pos_scale;
+    let ay = offset_y + item.anchor.1 * pos_scale;
+    let x = match item.align.h() {
+        0 => ax,
+        1 => ax - tex_w / 2.0,
+        _ => ax - tex_w,
+    };
+    let y = match item.align.v() {
+        0 => ay - tex_h,
+        1 => ay - tex_h / 2.0,
+        _ => ay,
+    };
+    (x, y, tex_w, tex_h)
+}
+
 /// uniform 槽位内容：[alpha, 0, 0, 0]
 fn alpha_slot_bytes(mult: f32) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -833,13 +996,189 @@ mod rasterize_regression {
         assert_eq!(engine.active_items.len(), 1);
         let item = &engine.active_items[0];
         let (px, w, h) = engine
-            .rasterize_text(item)
+            .rasterize_text(item, 1.0, 2048)
             .expect("rasterize should succeed");
         let painted = px.chunks(4).filter(|p| p[3] > 0).count();
         assert!(
             painted > 50,
             "expected glyph coverage, got painted={painted} ({w}x{h})"
         );
+    }
+
+    /// 超长台词必须被压回纹理上限内，而不是建出超限纹理
+    ///
+    /// GLES 后端的 max_texture_dimension_2d 是 2048。ASS 里一条长台词按
+    /// fs=40 排版轻易超过这个宽度，之前会直接触发 wgpu validation 错误，
+    /// 连带整帧命令缓冲失效（真机上表现为 SIGABRT）。
+    /// 光栅化字号必须随等比缩放变化，否则窗口尺寸变了字形大小对不上
+    #[test]
+    fn rasterized_bitmap_scales_with_canvas_scale() {
+        let mut engine = SubtitleEngine::new(SubtitleConfig::default());
+        let font = crate::font::load_system_font().expect("system font");
+        engine.set_font(font);
+        engine.load_events(vec![SubtitleEvent {
+            start_time: 1.0,
+            end_time: 5.0,
+            text: "缩放测试".to_string(),
+            style: "Default".to_string(),
+        }]);
+        engine.update(2.0);
+        let item = &engine.active_items[0];
+
+        let (_, w_small, _) = engine.rasterize_text(item, 0.5, 2048).expect("rasterize");
+        let (_, w_big, _) = engine.rasterize_text(item, 1.0, 2048).expect("rasterize");
+
+        assert!(
+            w_big > w_small,
+            "2x canvas scale should rasterize wider: {w_small} -> {w_big}"
+        );
+        let ratio = w_big as f32 / w_small as f32;
+        assert!(
+            (1.8..2.2).contains(&ratio),
+            "expected ~2x width ratio, got {ratio}"
+        );
+    }
+
+    /// 字幕必须按 ASS 的 PlayRes 等比映射到**画面矩形**
+    ///
+    /// 分轴缩放会把 16:9 的字幕压扁（这正是"文字被压窄"），所以取两轴的较小值。
+    /// 映射目标从"整个 surface"改成"letterbox 之后的画面矩形"后，字幕才会贴住
+    /// 视频而不是落到黑边上。
+    #[test]
+    fn pos_scale_is_uniform_and_fits_video_rect() {
+        let (canvas_w, canvas_h) = (1920.0f32, 1080.0f32);
+
+        // (surface 宽, surface 高, 视频宽, 视频高)
+        for (sw, sh, vw, vh) in [
+            (1920.0f32, 1080.0f32, 1920.0f32, 1080.0f32),
+            (1080.0, 2340.0, 1920.0, 1080.0), // 竖屏播横屏视频 → letterbox
+            (1920.0, 600.0, 1920.0, 1080.0),  // 扁窗口播高视频 → pillarbox
+            (2400.0, 1080.0, 1920.0, 1080.0),
+        ] {
+            let rect = raptor_render::fit_video_rect(sw as u32, sh as u32, vw as u32, vh as u32);
+            let rw = rect.2;
+            let rh = rect.3;
+            let uniform = (rw / canvas_w).min(rh / canvas_h);
+
+            // 映射后必须完整落在画面矩形内（contain，不是 cover）
+            assert!(
+                canvas_w * uniform <= rw + 0.5,
+                "scaled width {} exceeds rect {rw}",
+                canvas_w * uniform
+            );
+            assert!(
+                canvas_h * uniform <= rh + 0.5,
+                "scaled height {} exceeds rect {rh}",
+                canvas_h * uniform
+            );
+            // 宽高比必须保持 —— 分别缩放的话这个等式不成立
+            let aspect_before = canvas_w / canvas_h;
+            let aspect_after = (canvas_w * uniform) / (canvas_h * uniform);
+            assert!(
+                (aspect_before - aspect_after).abs() < 1e-4,
+                "aspect changed: {aspect_before} -> {aspect_after} (rect {rw}x{rh})"
+            );
+        }
+    }
+
+    /// 核心保证：拖动窗口时字幕**位置自适应**但**尺寸恒定**
+    ///
+    /// 用户诉求原文是"不会跟随窗口拉伸或压缩，能自适应位置等属性，但大小不变"。
+    /// 这两个性质由两个独立系数实现：
+    /// - `content_scale`（字号）只看视频原生分辨率 → 拖窗口不变
+    /// - `pos_scale`（位置映射）看画面矩形 → 拖窗口跟着走
+    #[test]
+    fn subtitle_keeps_glyph_size_across_windows_but_tracks_video_rect() {
+        let mut engine = SubtitleEngine::new(SubtitleConfig::default());
+        let font = crate::font::load_system_font().expect("system font");
+        engine.set_font(font);
+        engine.load_events(vec![SubtitleEvent {
+            start_time: 1.0,
+            end_time: 5.0,
+            text: "大小不变".to_string(),
+            style: "Default".to_string(),
+        }]);
+        engine.update(2.0);
+        let item = engine.active_items[0].clone();
+
+        // 同一个 1080p 视频，铺在各种尺寸的窗口里
+        let windows = [
+            (1920u32, 1080u32),
+            (1080, 2340), // 竖屏手机
+            (2560, 1440),
+            (640, 480),
+        ];
+
+        let mut glyph_sizes = Vec::new();
+        for (sw, sh) in windows {
+            let area = raptor_render::OverlayArea::new(sw, sh, 1920, 1080);
+
+            // 字号系数：与窗口无关
+            let font_scale = area.content_scale(item.canvas.1);
+            assert!(
+                (font_scale - 1.0).abs() < 1e-6,
+                "1080p 视频在 {sw}x{sh} 窗口下字号系数应为 1.0，实际 {font_scale}"
+            );
+
+            // 位图尺寸按这个系数光栅化
+            let (_, tw, th) = engine
+                .rasterize_text(&item, font_scale, 2048)
+                .expect("rasterize");
+
+            // 位置映射看画面矩形
+            let rect = area.video_rect;
+            let pos_scale =
+                uniform_canvas_scale(item.canvas.0, item.canvas.1, rect.2 as u32, rect.3 as u32);
+            let (x, y, _, _) = subtitle_placement(&item, rect, pos_scale, tw as f32, th as f32);
+
+            // 字幕必须落在画面矩形内（不能跑到黑边上）
+            assert!(
+                x >= rect.0 - 1.0 && y >= rect.1 - 1.0,
+                "{sw}x{sh}: 字幕左上角 ({x}, {y}) 跑到画面矩形 {rect:?} 之外"
+            );
+            assert!(
+                x + tw as f32 <= rect.0 + rect.2 + 1.0,
+                "{sw}x{sh}: 字幕右边缘越过画面矩形"
+            );
+
+            glyph_sizes.push((tw, th));
+        }
+
+        // 所有窗口下的位图尺寸必须完全一致
+        for (w, h) in &glyph_sizes[1..] {
+            assert_eq!(
+                (*w, *h),
+                glyph_sizes[0],
+                "字号跟着窗口变了：{:?} → {:?}",
+                glyph_sizes[0],
+                (w, h)
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_subtitle_is_clamped_to_texture_limit() {
+        let mut engine = SubtitleEngine::new(SubtitleConfig::default());
+        let font = crate::font::load_system_font().expect("system font");
+        engine.set_font(font);
+
+        // 约 200 个汉字，fs=40 在 1920 画布上远超 2048 像素宽
+        let long: String = "超长字幕".repeat(50);
+        engine.load_events(vec![SubtitleEvent {
+            start_time: 1.0,
+            end_time: 5.0,
+            text: long,
+            style: "Default".to_string(),
+        }]);
+        engine.update(2.0);
+
+        let item = &engine.active_items[0];
+        let (_, w, h) = engine
+            .rasterize_text(item, 1.0, 2048)
+            .expect("rasterize should succeed");
+        assert!(w <= 2048, "width {w} exceeds texture limit");
+        assert!(h <= 2048, "height {h} exceeds texture limit");
+        assert!(w > 0 && h > 0, "clamped size must stay non-zero");
     }
 }
 

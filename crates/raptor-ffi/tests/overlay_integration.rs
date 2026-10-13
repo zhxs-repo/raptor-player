@@ -43,8 +43,7 @@ impl Overlay for MockOverlay {
         _encoder: &mut wgpu::CommandEncoder,
         _target: &wgpu::TextureView,
         _surface_format: wgpu::TextureFormat,
-        _surface_width: u32,
-        _surface_height: u32,
+        _area: raptor_render::OverlayArea,
     ) {
         // 集成测试不调用 render
     }
